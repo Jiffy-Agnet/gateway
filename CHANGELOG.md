@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.1.0-rc.2 (2026-08-04)
+
+### Refactoring
+
+- Update version retrieval to a function and adjust version in uv.lock
+  ([`48b0c8b`](https://github.com/Jiffy-Agnet/gateway/commit/48b0c8b76a578ff7aa4478373a7a2de6a0d69634))
+
+
 ## v0.1.0-rc.1 (2026-08-04)
 
 ### Bug Fixes
