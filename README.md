@@ -72,8 +72,8 @@ It's safe to re-run — it clones once and updates on later runs. If some value 
 git clone https://github.com/Jiffy-Agnet/gateway.git jiffy-gateway
 cd jiffy-gateway
 cp .env.example .env       # fill in git provider tokens, Redis URL, agent/LLM credentials
-docker compose -f docker-compose.prod.yml up -d --build
-docker compose -f docker-compose.prod.yml exec web python manage.py migrate
+docker compose -f compose.prod.yml up -d --build
+docker compose -f compose.prod.yml exec web python manage.py migrate
 ```
 
 </details>

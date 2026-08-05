@@ -19,7 +19,7 @@
 #      same command — no interactive prompts, since those aren't reliable
 #      when this script is piped into bash.
 #   5. Builds and starts Redis, the Docker Socket Proxy, the web service,
-#      and the Celery worker from docker-compose.prod.yml, then runs
+#      and the Celery worker from compose.prod.yml, then runs
 #      database migrations.
 #
 # Safe to re-run at any point: every step checks the current state first
@@ -37,7 +37,7 @@ set -euo pipefail
 JIFFY_REPO_URL="${JIFFY_REPO_URL:-https://github.com/Jiffy-Agnet/gateway.git}"
 JIFFY_REPO_BRANCH="${JIFFY_REPO_BRANCH:-develop}"
 JIFFY_INSTALL_DIR="${JIFFY_INSTALL_DIR:-$HOME/jiffy-gateway}"
-COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
+COMPOSE_FILE="${COMPOSE_FILE:-compose.prod.yml}"
 
 # Plain file in the directory the script was invoked from. Resolved once,
 # right here, before anything cd's elsewhere — no directories are created
