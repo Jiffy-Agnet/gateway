@@ -2,40 +2,46 @@
 #
 # install.sh — one-command installer for Jiffy Gateway
 #
-# Usage — run from inside a Jiffy Gateway checkout:
-#   git clone https://github.com/Jiffy-Agnet/gateway.git
-#   cd gateway
-#   ./install.sh
+# Usage (remote, recommended):
+#   curl -fsSL https://raw.githubusercontent.com/Jiffy-Agnet/gateway/develop/install.sh | bash
 #
-# (You can also pipe the latest version of just this file into bash from
-# inside that same directory — curl -fsSL .../install.sh | bash — but the
-# script does not fetch the rest of the source itself: it builds directly
-# from the docker-compose.prod.yml already sitting next to it.)
+# Usage (local, after cloning):
+#   ./install.sh
 #
 # What it does:
 #   1. Installs missing prerequisites (git, curl, Docker + Compose plugin).
-#   2. Creates .env from .env.example and auto-generates every secret it
+#   2. Clones (or updates) the Jiffy Gateway source.
+#   3. Creates .env from .env.example and auto-generates every secret it
 #      safely can (SECRET_KEY, REDIS_PASSWORD, per-provider ingest tokens).
-#   3. If anything is left that genuinely needs a human decision (a real
+#   4. If anything is left that genuinely needs a human decision (a real
 #      external credential that can't be guessed), it stops, tells you
 #      exactly which .env key(s) to fill in, and asks you to re-run the
 #      same command — no interactive prompts, since those aren't reliable
 #      when this script is piped into bash.
-#   4. Builds and starts the production stack straight from
-#      docker-compose.prod.yml (Redis, Docker Socket Proxy, web, Celery),
-#      then runs database migrations.
+#   5. Builds and starts Redis, the Docker Socket Proxy, the web service,
+#      and the Celery worker from docker-compose.prod.yml, then runs
+#      database migrations.
 #
 # Safe to re-run at any point: every step checks the current state first
-# and only does what's still needed. It never re-downloads the source.
+# and only does what's still needed.
 #
-# Every step is logged to $LOG_FILE (default: ./install.log).
+# Every step is logged to $LOG_FILE — a plain file in the directory you
+# ran this script from (default: ./install.log). No extra folder is ever
+# created for it.
 
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Configuration (override by exporting these before running the script)
 # ---------------------------------------------------------------------------
+JIFFY_REPO_URL="${JIFFY_REPO_URL:-https://github.com/Jiffy-Agnet/gateway.git}"
+JIFFY_REPO_BRANCH="${JIFFY_REPO_BRANCH:-develop}"
+JIFFY_INSTALL_DIR="${JIFFY_INSTALL_DIR:-$HOME/jiffy-gateway}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
+
+# Plain file in the directory the script was invoked from. Resolved once,
+# right here, before anything cd's elsewhere — no directories are created
+# for it.
 LOG_FILE="${JIFFY_INSTALL_LOG:-$(pwd)/install.log}"
 
 # Services actually started by this script. "sandbox" in the compose file is
@@ -51,7 +57,6 @@ OPTIONAL_KEYS=(SENTRY_DSN SANDBOX_NETWORK_ALLOWLIST SANDBOX_NETWORK_ALLOWLIST_EX
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
 if ! touch "$LOG_FILE" 2>/dev/null; then
   LOG_FILE="/tmp/jiffy-install.log"
   touch "$LOG_FILE"
@@ -174,13 +179,20 @@ docker_compose() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 3 — Confirm we're inside a real checkout (never re-fetch the source)
+# Step 3 — Clone or update the source
 # ---------------------------------------------------------------------------
-verify_checkout() {
-  if [ ! -f "$COMPOSE_FILE" ] || [ ! -f .env.example ] || [ ! -f manage.py ]; then
-    fail "This doesn't look like a Jiffy Gateway checkout (missing $COMPOSE_FILE, .env.example or manage.py in $(pwd)). Clone the repo and run this script from inside it: git clone https://github.com/Jiffy-Agnet/gateway.git && cd gateway && ./install.sh"
+fetch_source() {
+  if [ -d "$JIFFY_INSTALL_DIR/.git" ]; then
+    info "Existing install found at $JIFFY_INSTALL_DIR, updating..."
+    git -C "$JIFFY_INSTALL_DIR" fetch origin "$JIFFY_REPO_BRANCH" >>"$LOG_FILE" 2>&1
+    git -C "$JIFFY_INSTALL_DIR" checkout "$JIFFY_REPO_BRANCH" >>"$LOG_FILE" 2>&1
+    git -C "$JIFFY_INSTALL_DIR" pull --ff-only origin "$JIFFY_REPO_BRANCH" >>"$LOG_FILE" 2>&1
+  else
+    info "Cloning Jiffy Gateway into $JIFFY_INSTALL_DIR..."
+    git clone --branch "$JIFFY_REPO_BRANCH" "$JIFFY_REPO_URL" "$JIFFY_INSTALL_DIR" >>"$LOG_FILE" 2>&1 \
+      || fail "Could not clone $JIFFY_REPO_URL (branch $JIFFY_REPO_BRANCH)."
   fi
-  info "Confirmed Jiffy Gateway checkout at $(pwd)."
+  cd "$JIFFY_INSTALL_DIR"
 }
 
 # ---------------------------------------------------------------------------
@@ -220,13 +232,14 @@ prepare_env_file() {
     info "Generated REDIS_PASSWORD."
   fi
 
-  local token_key current
+  local token_key current example
   for token_key in GITHUB_INGEST_TOKEN GITLAB_INGEST_TOKEN GITEA_INGEST_TOKEN; do
     current="$(current_env_value "$token_key")"
-    # Regenerate if blank, or if it's still the example placeholder shipped
-    # in .env.example (identical, and therefore unsafe, across every fresh
+    example="$(grep -E "^${token_key}=" .env.example 2>/dev/null | head -n1 | cut -d'=' -f2-)"
+    # Regenerate if blank, or if it still matches the value shipped in
+    # .env.example (identical, and therefore unsafe, across every fresh
     # checkout).
-    if [ -z "$current" ] || [ "$current" = '123456789alcjQJE!@O!@SFsdf2312' ]; then
+    if [ -z "$current" ] || [ "$current" = "$example" ]; then
       set_env_value "$token_key" "$(random_secret)"
       info "Generated $token_key."
     fi
@@ -260,10 +273,10 @@ prepare_env_file() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 5 — Start services + migrate
+# Step 5 — Build, start services, migrate
 # ---------------------------------------------------------------------------
 start_services() {
-  info "Starting services (${COMPOSE_SERVICES[*]}) via $COMPOSE_FILE..."
+  info "Building and starting services (${COMPOSE_SERVICES[*]}) via $COMPOSE_FILE..."
   docker_compose -f "$COMPOSE_FILE" up -d --build "${COMPOSE_SERVICES[@]}" >>"$LOG_FILE" 2>&1 \
     || fail "docker compose up failed. See $LOG_FILE for details."
 
@@ -289,14 +302,14 @@ main() {
   info "=== Jiffy Gateway installer starting ==="
   install_basic_tools
   install_docker
-  verify_checkout
+  fetch_source
   prepare_env_file
   start_services
   info "=== Jiffy Gateway is up ==="
 
   echo
   echo "Jiffy Gateway is running."
-  echo "  Install directory: $(pwd)"
+  echo "  Install directory: $JIFFY_INSTALL_DIR"
   echo "  Web port:          $(current_env_value WEB_PORT)"
   echo "  Log file:          $LOG_FILE"
   echo
