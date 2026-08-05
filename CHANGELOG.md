@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.1.0-rc.3 (2026-08-05)
+
+### Bug Fixes
+
+- Update Docker Compose file references in README and install script
+  ([`c42a2cb`](https://github.com/Jiffy-Agnet/gateway/commit/c42a2cb815336072a4b07e919dd992f6ede6674e))
+
+
 ## v0.1.0-rc.2 (2026-08-04)
 
 ### Refactoring
