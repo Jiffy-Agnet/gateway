@@ -51,20 +51,32 @@ Issue mention ──▶ Edge check (Action) ──▶ gateway ──▶ Queue �
 
 ### Prerequisites
 
-- Docker and Docker Compose
-- A Redis instance (or use the bundled one via Docker Compose)
+- A Linux host (Docker and Docker Compose will be installed for you if missing)
 - A git provider account/token with permission to push branches and open PRs on the target repo(s)
 - Access to your chosen coding agent/LLM backend
 
 ### Quick Start
 
+The fastest way to get Jiffy Gateway running is the installer script. It installs every prerequisite it can (including Docker itself), generates `.env`, starts all services, and runs migrations — with no manual steps beyond running it:
+
 ```bash
-git clone https://github.com/javadib/jiffy_gateway.git
-cd jiffy
-cp .env.example .env       # fill in git provider tokens, Redis URL, agent/LLM credentials
-docker compose up -d
-python manage.py migrate
+curl -fsSL https://raw.githubusercontent.com/Jiffy-Agnet/gateway/develop/install.sh | bash
 ```
+
+It's safe to re-run. If some value it can't generate for you (a real external credential) still needs filling in, it will tell you exactly which `.env` key(s) to edit and ask you to re-run the same command — it never prompts interactively mid-run.
+
+<details>
+<summary>Prefer to set it up by hand?</summary>
+
+```bash
+git clone https://github.com/Jiffy-Agnet/gateway.git jiffy-gateway
+cd jiffy-gateway
+cp .env.example .env       # fill in git provider tokens, Redis URL, agent/LLM credentials
+docker compose -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.prod.yml exec web python manage.py migrate
+```
+
+</details>
 
 ### Connect a Repository
 
