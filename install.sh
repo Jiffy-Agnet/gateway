@@ -18,13 +18,16 @@
 #      exactly which .env key(s) to fill in, and asks you to re-run the
 #      same command — no interactive prompts, since those aren't reliable
 #      when this script is piped into bash.
-#   5. Starts Redis, the Docker Socket Proxy, the web service, and the
-#      Celery worker, then runs database migrations.
+#   5. Builds and starts Redis, the Docker Socket Proxy, the web service,
+#      and the Celery worker from docker-compose.prod.yml, then runs
+#      database migrations.
 #
 # Safe to re-run at any point: every step checks the current state first
 # and only does what's still needed.
 #
-# Every step is logged to $LOG_FILE (default: <install dir>/install.log).
+# Every step is logged to $LOG_FILE — a plain file in the directory you
+# ran this script from (default: ./install.log). No extra folder is ever
+# created for it.
 
 set -euo pipefail
 
@@ -35,7 +38,11 @@ JIFFY_REPO_URL="${JIFFY_REPO_URL:-https://github.com/Jiffy-Agnet/gateway.git}"
 JIFFY_REPO_BRANCH="${JIFFY_REPO_BRANCH:-develop}"
 JIFFY_INSTALL_DIR="${JIFFY_INSTALL_DIR:-$HOME/jiffy-gateway}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
-LOG_FILE="${JIFFY_INSTALL_LOG:-$JIFFY_INSTALL_DIR/install.log}"
+
+# Plain file in the directory the script was invoked from. Resolved once,
+# right here, before anything cd's elsewhere — no directories are created
+# for it.
+LOG_FILE="${JIFFY_INSTALL_LOG:-$(pwd)/install.log}"
 
 # Services actually started by this script. "sandbox" in the compose file is
 # a manual smoke-test/debug container, not part of the task-execution path —
@@ -50,7 +57,6 @@ OPTIONAL_KEYS=(SENTRY_DSN SANDBOX_NETWORK_ALLOWLIST SANDBOX_NETWORK_ALLOWLIST_EX
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
 if ! touch "$LOG_FILE" 2>/dev/null; then
   LOG_FILE="/tmp/jiffy-install.log"
   touch "$LOG_FILE"
@@ -173,7 +179,7 @@ docker_compose() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 3 — Fetch/update the source
+# Step 3 — Clone or update the source
 # ---------------------------------------------------------------------------
 fetch_source() {
   if [ -d "$JIFFY_INSTALL_DIR/.git" ]; then
@@ -267,10 +273,10 @@ prepare_env_file() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 5 — Start services + migrate
+# Step 5 — Build, start services, migrate
 # ---------------------------------------------------------------------------
 start_services() {
-  info "Starting services (${COMPOSE_SERVICES[*]}) via $COMPOSE_FILE..."
+  info "Building and starting services (${COMPOSE_SERVICES[*]}) via $COMPOSE_FILE..."
   docker_compose -f "$COMPOSE_FILE" up -d --build "${COMPOSE_SERVICES[@]}" >>"$LOG_FILE" 2>&1 \
     || fail "docker compose up failed. See $LOG_FILE for details."
 

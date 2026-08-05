@@ -57,13 +57,13 @@ Issue mention ──▶ Edge check (Action) ──▶ gateway ──▶ Queue �
 
 ### Quick Start
 
-The fastest way to get Jiffy Gateway running is the installer script. It installs every prerequisite it can (including Docker itself), generates `.env`, starts all services, and runs migrations — with no manual steps beyond running it:
+The fastest way to get Jiffy Gateway running is the installer script. It installs every prerequisite it can (including Docker itself), clones the repo, generates `.env`, builds and starts the production stack, and runs migrations — with no manual steps beyond running it:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Jiffy-Agnet/gateway/develop/install.sh | bash
 ```
 
-It's safe to re-run. If some value it can't generate for you (a real external credential) still needs filling in, it will tell you exactly which `.env` key(s) to edit and ask you to re-run the same command — it never prompts interactively mid-run.
+It's safe to re-run — it clones once and updates on later runs. If some value it can't generate for you (a real external credential) still needs filling in, it will tell you exactly which `.env` key(s) to edit and ask you to re-run the same command — it never prompts interactively mid-run.
 
 <details>
 <summary>Prefer to set it up by hand?</summary>
@@ -72,7 +72,7 @@ It's safe to re-run. If some value it can't generate for you (a real external cr
 git clone https://github.com/Jiffy-Agnet/gateway.git jiffy-gateway
 cd jiffy-gateway
 cp .env.example .env       # fill in git provider tokens, Redis URL, agent/LLM credentials
-docker compose -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.prod.yml up -d --build
 docker compose -f docker-compose.prod.yml exec web python manage.py migrate
 ```
 
