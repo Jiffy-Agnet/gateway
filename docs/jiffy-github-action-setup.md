@@ -114,12 +114,12 @@ JSON body with the following nested structure:
 
 ## 5. Required repository secrets
 
-Create the following secrets in your repository's **Settings > Secrets and
+Create the following secrets and variables in your repository's **Settings > Secrets and
 variables > Actions** page.
 
 | Secret / Variable name | Description |
 |------------------------|-------------|
-| `JIFFY_GATEWAY_URL` (secret) | The base URL of your Jiffy Gateway instance (e.g. `https://jiffy.example.com`). |
+| `JIFFY_GATEWAY_URL` (variable) | The base URL of your Jiffy Gateway instance (e.g. `https://jiffy.example.com`). It's not a credential — just the address the workflow posts to — so set it as a repository **variable** in **Settings > Secrets and variables > Actions > Variables**, not a secret. |
 | `JIFFY_GITHUB_INGEST_TOKEN` (secret) | The shared ingestion secret for this provider / deployment. Must match the `GITHUB_INGEST_TOKEN` environment variable configured on the Gateway. Generate it with a cryptographically secure tool (see [SECRETS.md](../SECRETS.md)). |
 | `JIFFY_BOT_LOGIN` (variable) | The GitHub login of the Jiffy bot account used to post replies on issues. This is used to distinguish agent replies from human comments when building the `turns` array. Set it as a repository **variable** (not a secret) in **Settings > Secrets and variables > Actions > Variables**. |
 | `JIFFY_REPO_PAT` (secret) | A fine-grained GitHub Personal Access Token with **Contents** (read/write) and **Pull requests** (read/write) permissions, scoped to the repository. |
@@ -212,7 +212,7 @@ jobs:
       - name: Collect thread and dispatch to Jiffy Gateway
         uses: actions/github-script@v9
         env:
-          JIFFY_URL: ${{ secrets.JIFFY_GATEWAY_URL }}
+          JIFFY_URL: ${{ vars.JIFFY_GATEWAY_URL }}
           JIFFY_INGEST_TOKEN: ${{ secrets.JIFFY_GITHUB_INGEST_TOKEN }}
           JIFFY_BOT_LOGIN: ${{ vars.JIFFY_BOT_LOGIN }}
           JIFFY_USER_WHITELIST: ${{ vars.JIFFY_USER_WHITELIST }}
