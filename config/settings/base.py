@@ -28,14 +28,18 @@ _allowed_hosts_raw = os.environ.get("ALLOWED_HOSTS", "")
 ALLOWED_HOSTS = [h.strip() for h in _allowed_hosts_raw.split(",") if h.strip()] if _allowed_hosts_raw else ["localhost", "127.0.0.1"]
 
 
-__version__ = "0.1.0"
+__version__ = "0.1.1-rc.1"
 
-try:
-    with open(BASE_DIR / "pyproject.toml", "rb") as f:
-        _pyproject = tomllib.load(f)
-        __version__ = _pyproject["project"]["version"]
-except (FileNotFoundError, KeyError, tomllib.TOMLDecodeError):
-    pass
+def get_app_version():
+    try:
+        with open(BASE_DIR / "pyproject.toml", "rb") as f:
+            _pyproject = tomllib.load(f)
+            __version__ = _pyproject["project"]["version"]
+    except (FileNotFoundError, KeyError, tomllib.TOMLDecodeError):
+        pass
+    return __version__
+
+__version__ = get_app_version()
 
 # Application definition
 
@@ -216,7 +220,7 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 
 # Logging
 LOGGING = {
-    "version": 0,
+    "version": 1,
     "disable_existing_loggers": False,
     "formatters": {
         "verbose": {

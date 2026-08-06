@@ -2,7 +2,23 @@
 
 <!-- version list -->
 
-## v0.1.0 (2026-08-04)
+## v0.1.1-rc.1 (2026-08-06)
+
+
+## v0.1.0-rc.3 (2026-08-05)
+
+### Bug Fixes
+
+- Update Docker Compose file references in README and install script
+  ([`c42a2cb`](https://github.com/Jiffy-Agnet/gateway/commit/c42a2cb815336072a4b07e919dd992f6ede6674e))
+
+
+## v0.1.0-rc.2 (2026-08-04)
+
+### Refactoring
+
+- Update version retrieval to a function and adjust version in uv.lock
+  ([`48b0c8b`](https://github.com/Jiffy-Agnet/gateway/commit/48b0c8b76a578ff7aa4478373a7a2de6a0d69634))
 
 
 ## v0.1.0-rc.1 (2026-08-04)
