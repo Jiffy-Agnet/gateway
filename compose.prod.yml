@@ -1,6 +1,6 @@
 services:
   web:
-    image: jiffyai/jiffy:${JIFFY_IMAGE_VERSION:-latest}
+    image: ghcr.io/jiffy-agnet/gateway:${JIFFY_GATEWAY_IMAGE_VERSION:-dev}
     container_name: web
     user: root
     command: uv run python manage.py runserver 0.0.0.0:8000
@@ -42,7 +42,7 @@ services:
         max-file: "3"
 
   celery:
-    image: jiffyai/jiffy:${JIFFY_IMAGE_VERSION:-latest}
+    image: ghcr.io/jiffy-agnet/gateway:${JIFFY_GATEWAY_IMAGE_VERSION:-dev}
     container_name: celery
     command: uv run celery -A config worker -Q execute --concurrency=3 -l info -n execute@%h
     user: root

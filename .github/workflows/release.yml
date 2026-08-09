@@ -67,7 +67,7 @@ jobs:
 
   docker:
     needs: release
-    if: needs.release.outputs.released == 'true' && github.ref == 'refs/heads/master'
+    if: needs.release.outputs.released == 'true' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/develop')
     permissions:
       contents: read
       packages: write
