@@ -10,13 +10,19 @@ from django.test import TestCase, override_settings
 from jobs.execution.agent import AgentResult, build_agent_instructions, read_agent_result, _extract_issue_text, _format_turns
 from jobs.execution.container import (
     _apply_network_restriction,
+    _apply_pnpm_limits,
     _build_network_restriction_script,
     _effective_network_allowlist,
     _extract_git_host,
     _inject_token_into_url,
     _redact_url,
+    build_package_manager_env,
     ensure_sandbox_image,
     get_docker_client,
+    parse_memory_bytes,
+    resolve_cpu_nano_cpus,
+    resolve_memory_limits,
+    resolve_node_heap_mb,
     start_generic_sandbox_container,
 )
 from jobs.execution.exceptions import ContainerError
@@ -942,6 +948,145 @@ class ExecuteTaskLoggingTest(TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Sandbox resource limits
+# ---------------------------------------------------------------------------
+
+
+class ParseMemoryBytesTest(TestCase):
+    def test_parses_suffixes(self):
+        self.assertEqual(parse_memory_bytes("512m"), 512 * 1024 ** 2)
+        self.assertEqual(parse_memory_bytes("2G"), 2 * 1024 ** 3)
+        self.assertEqual(parse_memory_bytes("1024k"), 1024 * 1024)
+        self.assertEqual(parse_memory_bytes("2048b"), 2048)
+
+    def test_parses_bare_numbers_and_ints(self):
+        self.assertEqual(parse_memory_bytes("1048576"), 1048576)
+        self.assertEqual(parse_memory_bytes(1048576), 1048576)
+
+    def test_unlimited_sentinel(self):
+        self.assertEqual(parse_memory_bytes("-1"), -1)
+
+    def test_invalid_returns_none(self):
+        self.assertIsNone(parse_memory_bytes("plenty"))
+        self.assertIsNone(parse_memory_bytes(""))
+        self.assertIsNone(parse_memory_bytes(None))
+
+
+class ResolveMemoryLimitsTest(TestCase):
+    @override_settings(SANDBOX_MEMORY_LIMIT="2g", SANDBOX_MEMORY_SWAP_LIMIT="4g")
+    def test_valid_pair_passed_through(self):
+        mem, swap = resolve_memory_limits()
+        self.assertEqual(mem, "2g")
+        self.assertEqual(swap, 4 * 1024 ** 3)
+
+    @override_settings(SANDBOX_MEMORY_LIMIT="2g", SANDBOX_MEMORY_SWAP_LIMIT="-1")
+    def test_unlimited_swap_passed_through(self):
+        mem, swap = resolve_memory_limits()
+        self.assertEqual(mem, "2g")
+        self.assertEqual(swap, -1)
+
+    @override_settings(SANDBOX_MEMORY_LIMIT="2g", SANDBOX_MEMORY_SWAP_LIMIT="1g")
+    def test_swap_below_memory_warns_and_falls_back(self):
+        with self.assertLogs("jobs.execution.container", level="WARNING") as cm:
+            mem, swap = resolve_memory_limits()
+        self.assertEqual(mem, "2g")
+        self.assertEqual(swap, 4 * 1024 ** 3)  # 2x the memory limit
+        self.assertIn("SANDBOX_MEMORY_SWAP_LIMIT", cm.output[0])
+
+    @override_settings(SANDBOX_MEMORY_LIMIT="2g", SANDBOX_MEMORY_SWAP_LIMIT="lots")
+    def test_unparseable_swap_warns_and_falls_back(self):
+        with self.assertLogs("jobs.execution.container", level="WARNING"):
+            _, swap = resolve_memory_limits()
+        self.assertEqual(swap, 4 * 1024 ** 3)
+
+    @override_settings(SANDBOX_MEMORY_LIMIT="huge", SANDBOX_MEMORY_SWAP_LIMIT="4g")
+    def test_unparseable_memory_falls_back_to_default(self):
+        with self.assertLogs("jobs.execution.container", level="WARNING"):
+            mem, swap = resolve_memory_limits()
+        self.assertEqual(mem, "2g")
+        self.assertEqual(swap, 4 * 1024 ** 3)
+
+
+class ResolveCpuLimitTest(TestCase):
+    @override_settings(SANDBOX_CPU_LIMIT="1.5")
+    def test_fractional_cores(self):
+        self.assertEqual(resolve_cpu_nano_cpus(), 1_500_000_000)
+
+    @override_settings(SANDBOX_CPU_LIMIT="2")
+    def test_whole_cores(self):
+        self.assertEqual(resolve_cpu_nano_cpus(), 2_000_000_000)
+
+    @override_settings(SANDBOX_CPU_LIMIT="all-of-them")
+    def test_invalid_falls_back_with_warning(self):
+        with self.assertLogs("jobs.execution.container", level="WARNING"):
+            self.assertEqual(resolve_cpu_nano_cpus(), 1_500_000_000)
+
+    @override_settings(SANDBOX_CPU_LIMIT="0")
+    def test_zero_falls_back_with_warning(self):
+        with self.assertLogs("jobs.execution.container", level="WARNING"):
+            self.assertEqual(resolve_cpu_nano_cpus(), 1_500_000_000)
+
+
+class WorkerConcurrencyTest(TestCase):
+    """The concurrency setting must actually reach the worker, not just docs."""
+
+    def test_setting_is_read_by_celery_app(self):
+        from django.conf import settings as django_settings
+
+        from config.celery import app
+
+        self.assertEqual(
+            app.conf.worker_concurrency,
+            django_settings.CELERY_WORKER_CONCURRENCY,
+        )
+
+    def test_default_is_one(self):
+        from django.conf import settings as django_settings
+
+        self.assertEqual(django_settings.CELERY_WORKER_CONCURRENCY, 1)
+
+
+class PackageManagerLimitsTest(TestCase):
+    @override_settings(SANDBOX_NODE_MAX_OLD_SPACE_MB="")
+    def test_heap_derived_from_memory_limit(self):
+        self.assertEqual(resolve_node_heap_mb("2g"), 1024)
+
+    @override_settings(SANDBOX_NODE_MAX_OLD_SPACE_MB="")
+    def test_heap_has_floor(self):
+        self.assertEqual(resolve_node_heap_mb("256m"), 512)
+
+    @override_settings(SANDBOX_NODE_MAX_OLD_SPACE_MB="1536")
+    def test_explicit_heap_wins(self):
+        self.assertEqual(resolve_node_heap_mb("2g"), 1536)
+
+    @override_settings(SANDBOX_NODE_MAX_OLD_SPACE_MB="", SANDBOX_PACKAGE_CONCURRENCY=2)
+    def test_env_caps_memory_and_parallelism(self):
+        env = build_package_manager_env("2g")
+        self.assertEqual(env["NODE_OPTIONS"], "--max-old-space-size=1024")
+        self.assertEqual(env["npm_config_maxsockets"], "2")
+        self.assertEqual(env["npm_config_jobs"], "2")
+        self.assertEqual(env["CARGO_BUILD_JOBS"], "2")
+        self.assertEqual(env["MAKEFLAGS"], "-j2")
+        self.assertEqual(env["GOMAXPROCS"], "2")
+
+    @override_settings(SANDBOX_PACKAGE_CONCURRENCY=1)
+    def test_pnpm_config_rewritten(self):
+        container = MagicMock()
+        container.exec_run.return_value = (0, (b"", b""))
+        _apply_pnpm_limits(container, task_id=3)
+        script = container.exec_run.call_args.kwargs["cmd"][2]
+        self.assertIn("networkConcurrency", script)
+        self.assertIn("childConcurrency", script)
+        self.assertIn("/home/jiffy/.config/pnpm/config.yaml", script)
+
+    def test_pnpm_config_failure_is_not_fatal(self):
+        container = MagicMock()
+        container.exec_run.return_value = (1, (b"", b"no such file"))
+        with self.assertLogs("jobs.execution.container", level="WARNING"):
+            _apply_pnpm_limits(container, task_id=3)
+
+
+# ---------------------------------------------------------------------------
 # Network egress restriction
 # ---------------------------------------------------------------------------
 
@@ -1039,6 +1184,31 @@ class NetworkRestrictionTest(TestCase):
         # Restriction rules applied before yield via a root exec.
         root_execs = [c for c in container.exec_run.call_args_list if c.kwargs.get("user") == "root"]
         self.assertEqual(len(root_execs), 1)
+
+    @patch("jobs.execution.container.get_docker_client")
+    def test_start_container_applies_resource_limits(self, mock_client):
+        client, container = self._mock_container_start(mock_client)
+
+        with override_settings(
+            SANDBOX_CLEANUP=False,
+            SANDBOX_MEMORY_LIMIT="3g",
+            SANDBOX_MEMORY_SWAP_LIMIT="6g",
+            SANDBOX_CPU_LIMIT="1.5",
+            SANDBOX_NODE_MAX_OLD_SPACE_MB="",
+            SANDBOX_PACKAGE_CONCURRENCY=2,
+        ):
+            with start_generic_sandbox_container(1, {"REPO_TOKEN": "tok"}):
+                pass
+
+        kwargs = client.containers.run.call_args.kwargs
+        self.assertEqual(kwargs["mem_limit"], "3g")
+        self.assertEqual(kwargs["memswap_limit"], 6 * 1024 ** 3)
+        self.assertEqual(kwargs["nano_cpus"], 1_500_000_000)
+        # cpuset_cpus pinned a core index rather than capping share — gone.
+        self.assertNotIn("cpuset_cpus", kwargs)
+        # Package-manager caps are in the container env from the start.
+        self.assertEqual(kwargs["environment"]["NODE_OPTIONS"], "--max-old-space-size=1536")
+        self.assertEqual(kwargs["environment"]["npm_config_maxsockets"], "2")
 
     @patch("jobs.execution.container.get_docker_client")
     def test_start_container_unrestricted_skips_cap_and_rules(self, mock_client):

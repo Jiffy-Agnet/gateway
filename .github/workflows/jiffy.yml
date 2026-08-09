@@ -22,10 +22,10 @@ jobs:
         uses: actions/github-script@v9
         env:
           JIFFY_URL: ${{ vars.JIFFY_GATEWAY_URL }}
-          JIFFY_INGEST_TOKEN: ${{ secrets.JIFFY_GITHUB_INGEST_TOKEN }}
           JIFFY_BOT_LOGIN: ${{ vars.JIFFY_BOT_LOGIN }}
           JIFFY_USER_WHITELIST: ${{ vars.JIFFY_USER_WHITELIST }}
           REPO_TOKEN: ${{ secrets.JIFFY_REPO_PAT }}
+          JIFFY_INGEST_TOKEN: ${{ secrets.JIFFY_GITHUB_INGEST_TOKEN }}
           ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
         with:
           script: |

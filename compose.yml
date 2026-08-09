@@ -37,7 +37,9 @@ services:
       context: .
       dockerfile: Dockerfile
       target: runner
-    command: uv run celery -A config worker -Q execute --concurrency=3 -l info -n execute@%h
+    # No --concurrency flag: the worker reads CELERY_WORKER_CONCURRENCY from
+    # settings (env_file below) so it can be tuned per host.
+    command: uv run celery -A config worker -Q execute -l info -n execute@%h
     user: root
     volumes:
       - .:/app

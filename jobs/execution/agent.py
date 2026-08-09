@@ -139,6 +139,18 @@ use `git checkout <branch>` or `git pull` only.
 
 All work — reading files, making changes, running tests — happens inside that
 directory unless you have a reason to go elsewhere.
+
+## Resource Limits
+
+This sandbox runs with a hard memory and CPU cap. Package installs and builds
+are the usual way to hit it: a process killed with exit code 137 means the
+container ran out of memory, not that your change was wrong.
+
+`NODE_OPTIONS`, `npm_config_*`, `CARGO_BUILD_JOBS`, `MAKEFLAGS` and
+`GOMAXPROCS` are already set in your environment to keep installs within the
+cap — do not unset or raise them. If an install or build is still OOM-killed,
+retry it with lower parallelism (e.g. `npm install --maxsockets=1`,
+`pnpm install --network-concurrency=1`) rather than raising the limits.
 {where_to_start_block}
 ## What You Must Do
 
