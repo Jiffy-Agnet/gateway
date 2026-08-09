@@ -21,7 +21,6 @@ services:
       GITHUB_INGEST_TOKEN: ${GITHUB_INGEST_TOKEN}
       GITLAB_INGEST_TOKEN: ${GITLAB_INGEST_TOKEN}
       GITEA_INGEST_TOKEN: ${GITEA_INGEST_TOKEN}
-      SANDBOX_OPENCODE_CONFIG_PATH: ${SANDBOX_OPENCODE_CONFIG_PATH}
     depends_on:
       redis:
         condition: service_healthy
@@ -62,7 +61,6 @@ services:
       GITHUB_INGEST_TOKEN: ${GITHUB_INGEST_TOKEN}
       GITLAB_INGEST_TOKEN: ${GITLAB_INGEST_TOKEN}
       GITEA_INGEST_TOKEN: ${GITEA_INGEST_TOKEN}
-      SANDBOX_OPENCODE_CONFIG_PATH: ${SANDBOX_OPENCODE_CONFIG_PATH}
       # Sandbox network egress restriction — forwarded so the worker applies
       # it to each sandbox container it provisions.
       JIFFY_SANDBOX_NETWORK_RESTRICTED: ${JIFFY_SANDBOX_NETWORK_RESTRICTED:-true}

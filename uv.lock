@@ -355,7 +355,7 @@ wheels = [
 
 [[package]]
 name = "jiffy-gateway"
-version = "0.1.0rc1"
+version = "0.1.2rc2"
 source = { virtual = "." }
 dependencies = [
     { name = "celery" },
