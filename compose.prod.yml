@@ -186,39 +186,6 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  sandbox:
-    build:
-      context: ./docker/sandbox
-      dockerfile: Dockerfile
-    container_name: jiffy-sandbox-dev
-    user: root
-    stdin_open: true
-    tty: true
-    cap_add:
-      - NET_ADMIN
-    environment:
-      JIFFY_SANDBOX_NETWORK_RESTRICTED: ${JIFFY_SANDBOX_NETWORK_RESTRICTED:-true}
-      SANDBOX_NETWORK_ALLOWLIST: ${SANDBOX_NETWORK_ALLOWLIST:-}
-    command: ["bash", "-c", "bash /smoke-test.sh; echo '=== Smoke test complete, container staying alive for debugging ==='; while true; do sleep 86400; done"]
-    volumes:
-      - .:/workspace:ro
-      - ./docker/sandbox/smoke-test.sh:/smoke-test.sh:ro
-    networks:
-      - jiffy-internal
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 1g
-        reservations:
-          cpus: "0.25"
-          memory: 256m
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
 volumes:
   redis_data:
 
