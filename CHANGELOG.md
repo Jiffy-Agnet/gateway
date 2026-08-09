@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.1.2-rc.2 (2026-08-09)
+
+### Bug Fixes
+
+- Correct syntax for JIFFY_IMAGE_VERSION in .env.example
+  ([`eeec7db`](https://github.com/Jiffy-Agnet/gateway/commit/eeec7dbb7c2053d7733c39bd73f31f53445a85af))
+
+
 ## v0.1.2-rc.1 (2026-08-09)
 
 ### Bug Fixes
