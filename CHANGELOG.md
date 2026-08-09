@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.1.2-rc.3 (2026-08-09)
+
+### Bug Fixes
+
+- Update JIFFY_IMAGE_VERSION to JIFFY_GATEWAY_IMAGE_VERSION and adjust Docker image references
+  ([`75d1dce`](https://github.com/Jiffy-Agnet/gateway/commit/75d1dce7a9d9ffcfe04432b882090081c5357648))
+
+
 ## v0.1.2-rc.2 (2026-08-09)
 
 ### Bug Fixes
