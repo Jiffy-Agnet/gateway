@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.1.2-rc.1 (2026-08-09)
+
+### Bug Fixes
+
+- Read JIFFY_GATEWAY_URL from vars, not secrets
+  ([`1ba8793`](https://github.com/Jiffy-Agnet/gateway/commit/1ba8793e3f97ee1cf2e006c35b214d9631a77c42))
+
+### Documentation
+
+- Fix JIFFY_GATEWAY_URL — variable, not secret
+  ([`c5b132e`](https://github.com/Jiffy-Agnet/gateway/commit/c5b132e453c782e774305233bfb5edc3cb3b2411))
+
+
 ## v0.1.1 (2026-08-06)
 
 
