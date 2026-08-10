@@ -1,6 +1,6 @@
 [project]
 name = "jiffy-gateway"
-version = "0.1.2-rc.5"
+version = "0.2.0-rc.1"
 description = "Jiffy Autonomous Software Development Company"
 requires-python = ">=3.12"
 dependencies = [
