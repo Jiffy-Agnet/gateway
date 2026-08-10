@@ -65,6 +65,15 @@ curl -fsSL https://raw.githubusercontent.com/Jiffy-Agnet/gateway/develop/install
 
 It's safe to re-run — it clones once and updates on later runs. If some value it can't generate for you (a real external credential) still needs filling in, it will tell you exactly which `.env` key(s) to edit and ask you to re-run the same command — it never prompts interactively mid-run.
 
+#### Swap management
+
+Before starting services, the installer ensures the host has enough swap so sandbox containers don't get OOM-killed during heavy operations (e.g. package installs) on resource-constrained servers. It reads total RAM and current swap, and if swap is below `JIFFY_SWAP_RAM_MULTIPLIER` × RAM it creates (or extends) a dedicated swap file at `/var/jiffy-swapfile` (`JIFFY_SWAP_FILE`), activates it, and persists it in `/etc/fstab`. The step is idempotent — re-running the installer never creates duplicate swap files or duplicate `/etc/fstab` entries — and it only takes what it's given: if there isn't enough free disk to reach the target, it logs a warning and continues. It's entirely best-effort and never blocks or fails the install.
+
+- `JIFFY_SWAP_RAM_MULTIPLIER` — swap target as a multiple of total RAM (default `2`, i.e. swap ≥ 2× RAM).
+- `JIFFY_SWAP_FILE` — path of the managed swap file (default `/var/jiffy-swapfile`).
+
+Set these in the environment when running the installer, e.g. `JIFFY_SWAP_RAM_MULTIPLIER=1.5 curl -fsSL ... | bash`.
+
 <details>
 <summary>Prefer to set it up by hand?</summary>
 
