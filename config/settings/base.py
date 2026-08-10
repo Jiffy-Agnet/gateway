@@ -166,6 +166,15 @@ try:
 except ValueError:
     SANDBOX_PACKAGE_CONCURRENCY = 2
 
+# How long a single agent run may take before the Gateway gives up on it.
+# Enforced by the Gateway itself (it polls the exec state), so it is a real
+# budget rather than a side effect of whatever request timeout the Docker
+# client or an intermediate socket proxy happens to use.
+try:
+    SANDBOX_AGENT_TIMEOUT_SECONDS = max(60, int(os.environ.get("SANDBOX_AGENT_TIMEOUT", "3600")))
+except ValueError:
+    SANDBOX_AGENT_TIMEOUT_SECONDS = 3600
+
 # Whether to stop and remove sandbox containers after each job.
 # Set to "false" to leave containers running for debugging.
 SANDBOX_CLEANUP = os.environ.get("JIFFY_SANDBOX_CLEANUP", "true").lower() in ("true", "1", "yes")
