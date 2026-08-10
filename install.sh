@@ -10,15 +10,17 @@
 #
 # What it does:
 #   1. Installs missing prerequisites (git, curl, Docker + Compose plugin).
-#   2. Clones (or updates) the Jiffy Gateway source.
-#   3. Creates .env from .env.example and auto-generates every secret it
+#   2. Ensures the host has enough swap (JIFFY_SWAP_RAM_MULTIPLIER x RAM) so
+#      sandbox containers don't get OOM-killed during heavy installs.
+#   3. Clones (or updates) the Jiffy Gateway source.
+#   4. Creates .env from .env.example and auto-generates every secret it
 #      safely can (SECRET_KEY, REDIS_PASSWORD, per-provider ingest tokens).
-#   4. If anything is left that genuinely needs a human decision (a real
+#   5. If anything is left that genuinely needs a human decision (a real
 #      external credential that can't be guessed), it stops, tells you
 #      exactly which .env key(s) to fill in, and asks you to re-run the
 #      same command — no interactive prompts, since those aren't reliable
 #      when this script is piped into bash.
-#   5. Builds and starts Redis, the Docker Socket Proxy, the web service,
+#   6. Builds and starts Redis, the Docker Socket Proxy, the web service,
 #      and the Celery worker from compose.prod.yml, then runs
 #      database migrations.
 #
@@ -38,6 +40,12 @@ JIFFY_REPO_URL="${JIFFY_REPO_URL:-https://github.com/Jiffy-Agnet/gateway.git}"
 JIFFY_REPO_BRANCH="${JIFFY_REPO_BRANCH:-develop}"
 JIFFY_INSTALL_DIR="${JIFFY_INSTALL_DIR:-$HOME/jiffy-gateway}"
 COMPOSE_FILE="${COMPOSE_FILE:-compose.prod.yml}"
+
+# Host swap sizing. The install script makes sure total swap reaches at least
+# JIFFY_SWAP_RAM_MULTIPLIER x total RAM before Jiffy starts running tasks, so
+# sandbox containers don't get OOM-killed on resource-constrained hosts.
+JIFFY_SWAP_RAM_MULTIPLIER="${JIFFY_SWAP_RAM_MULTIPLIER:-2}"
+JIFFY_SWAP_FILE="${JIFFY_SWAP_FILE:-/var/jiffy-swapfile}"
 
 # Plain file in the directory the script was invoked from. Resolved once,
 # right here, before anything cd's elsewhere — no directories are created
@@ -134,7 +142,105 @@ install_basic_tools() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 2 — Docker + Compose plugin
+# Step 2 — Swap size check & adjustment
+# ---------------------------------------------------------------------------
+# Resource-constrained self-hosted servers (e.g. 2 CPU / 4 GB RAM) shared with
+# other services often have little or no swap, which lets sandbox containers
+# get OOM-killed (exit 137) during heavy operations like package installs.
+# This step proactively makes sure total swap reaches JIFFY_SWAP_RAM_MULTIPLIER
+# x total RAM. Best-effort: any failure (not enough disk, missing tools, no
+# root) logs a warning and skips — a failed swap step never aborts the install.
+# Idempotent: an existing Jiffy swap file is grown (not duplicated) and
+# /etc/fstab never gets a duplicate entry.
+ensure_swap() {
+  info "Checking host swap..."
+  if [ ! -f /proc/meminfo ]; then
+    warn "No /proc/meminfo found — skipping swap check."
+    return 0
+  fi
+
+  local mem_kb swap_kb multiplier target_kb
+  mem_kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo)"
+  swap_kb="$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)"
+  multiplier="${JIFFY_SWAP_RAM_MULTIPLIER:-2}"
+  case "$multiplier" in
+    ''|*[!0-9.]*)
+      warn "JIFFY_SWAP_RAM_MULTIPLIER='$multiplier' is not a positive number, using 2."
+      multiplier=2 ;;
+  esac
+  target_kb="$(awk -v m="$multiplier" -v k="$mem_kb" 'BEGIN { printf "%d", m*k }')"
+
+  info "Detected RAM: $((mem_kb / 1024)) MB, existing swap: $((swap_kb / 1024)) MB, target swap (${multiplier}x RAM): $((target_kb / 1024)) MB."
+
+  if [ "$swap_kb" -ge "$target_kb" ]; then
+    info "Swap already sufficient ($((swap_kb / 1024)) MB >= $((target_kb / 1024)) MB) — nothing to do."
+    return 0
+  fi
+
+  local swap_file dir file_kb active_kb non_managed_kb needed_kb avail_kb
+  swap_file="${JIFFY_SWAP_FILE}"
+  dir="$(dirname "$swap_file")"
+
+  file_kb=0
+  if [ -f "$swap_file" ]; then
+    file_kb="$(( $(stat -c %s "$swap_file" 2>/dev/null || echo 0) / 1024 ))"
+  fi
+  active_kb="$(awk -v f="$swap_file" '$1==f{print $3}' /proc/swaps 2>/dev/null)"
+  [ -n "$active_kb" ] || active_kb=0
+
+  # How much our managed file must provide (non-managed swap already counts).
+  non_managed_kb="$(( swap_kb - active_kb ))"
+  needed_kb="$(( target_kb - non_managed_kb ))"
+
+  if [ "$file_kb" -lt "$needed_kb" ]; then
+    avail_kb="$(df -k "$dir" 2>/dev/null | awk 'NR==2{print $4}')"
+    if [ -z "$avail_kb" ] || [ "$avail_kb" -lt "$needed_kb" ]; then
+      warn "Only ${avail_kb:-unknown} KB free on $dir but ${needed_kb} KB of swap is needed — skipping swap setup. Install will continue without it."
+      return 0
+    fi
+
+    if [ "$active_kb" -gt 0 ]; then
+      info "Disabling existing swap file $swap_file to resize it..."
+      as_root swapoff "$swap_file" >>"$LOG_FILE" 2>&1 || { warn "Could not disable $swap_file — skipping swap setup."; return 0; }
+      active_kb=0
+    fi
+
+    if [ -f "$swap_file" ]; then
+      info "Extending $swap_file to $((needed_kb / 1024)) MB..."
+    else
+      info "Creating $swap_file ($((needed_kb / 1024)) MB)..."
+    fi
+
+    # fallocate first (fast, sparse-safe on ext4/xfs); dd covers the rest.
+    if ! as_root fallocate -l "${needed_kb}K" "$swap_file" 2>>"$LOG_FILE"; then
+      info "fallocate failed — falling back to dd (slower)."
+      as_root dd if=/dev/zero of="$swap_file" bs=1K count="$needed_kb" status=none >>"$LOG_FILE" 2>&1 \
+        || { warn "Could not create swap file — skipping swap setup."; return 0; }
+    fi
+
+    as_root chmod 600 "$swap_file" >>"$LOG_FILE" 2>&1 || true
+    as_root mkswap "$swap_file" >>"$LOG_FILE" 2>&1 \
+      || { warn "mkswap failed on $swap_file — skipping swap setup."; return 0; }
+  fi
+
+  if [ "$active_kb" -eq 0 ]; then
+    as_root swapon "$swap_file" >>"$LOG_FILE" 2>&1 \
+      || { warn "swapon failed on $swap_file — skipping swap setup."; return 0; }
+  fi
+
+  if ! as_root grep -qE "^${swap_file}[[:space:]]" /etc/fstab 2>/dev/null; then
+    info "Persisting $swap_file in /etc/fstab..."
+    printf '%s none swap sw 0 0\n' "$swap_file" | as_root tee -a /etc/fstab >/dev/null 2>&1 \
+      || warn "Could not persist $swap_file in /etc/fstab — swap will not survive a reboot."
+  fi
+
+  local now_kb
+  now_kb="$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)"
+  info "Swap ready: total swap is now $((now_kb / 1024)) MB."
+}
+
+# ---------------------------------------------------------------------------
+# Step 3 — Docker + Compose plugin
 # ---------------------------------------------------------------------------
 install_docker() {
   if have docker && docker compose version >/dev/null 2>&1; then
@@ -181,7 +287,7 @@ docker_compose() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 3 — Clone or update the source
+# Step 4 — Clone or update the source
 # ---------------------------------------------------------------------------
 fetch_source() {
   if [ -d "$JIFFY_INSTALL_DIR/.git" ]; then
@@ -198,7 +304,7 @@ fetch_source() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 4 — Prepare .env
+# Step 5 — Prepare .env
 # ---------------------------------------------------------------------------
 set_env_value() {
   local key="$1" value="$2"
@@ -275,7 +381,7 @@ prepare_env_file() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 5 — Build, start services, migrate
+# Step 6 — Build, start services, migrate
 # ---------------------------------------------------------------------------
 start_services() {
   info "Building and starting services (${COMPOSE_SERVICES[*]}) via $COMPOSE_FILE..."
@@ -303,6 +409,7 @@ start_services() {
 main() {
   info "=== Jiffy Gateway installer starting ==="
   install_basic_tools
+  ensure_swap || warn "Swap check did not complete — continuing with the install."
   install_docker
   fetch_source
   prepare_env_file
