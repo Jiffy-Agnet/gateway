@@ -37,7 +37,9 @@ services:
       context: .
       dockerfile: Dockerfile
       target: runner
-    command: uv run celery -A config worker -Q execute --concurrency=3 -l info -n execute@%h
+    # No --concurrency flag: the worker reads CELERY_WORKER_CONCURRENCY from
+    # settings (env_file below) so it can be tuned per host.
+    command: uv run celery -A config worker -Q execute -l info -n execute@%h
     user: root
     volumes:
       - .:/app
@@ -54,9 +56,6 @@ services:
       REDIS_URL: redis://${REDIS_PASSWORD}@redis:6379/0
       CELERY_BROKER_URL: redis://${REDIS_PASSWORD}@redis:6379/1
       CELERY_RESULT_BACKEND: redis://${REDIS_PASSWORD}@redis:6379/2
-      # OpenCode config — the project root is mounted at /app, so the config
-      # file (opencode.json) is at /app/opencode.json inside this container.
-      SANDBOX_OPENCODE_CONFIG_PATH: /app/opencode.json
       # Sandbox network egress restriction — forwarded so the worker applies
       # it to each sandbox container it provisions.
       JIFFY_SANDBOX_NETWORK_RESTRICTED: ${JIFFY_SANDBOX_NETWORK_RESTRICTED:-true}

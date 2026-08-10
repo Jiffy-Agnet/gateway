@@ -26,7 +26,7 @@ uv run pytest                          # same suite; pytest reports 122, manage.
 node tests/edge/jiffy_workflow.test.cjs # GitHub edge workflow regression test (manual)
 uv run python manage.py migrate
 uv run python manage.py runserver      # dev server
-uv run celery -A config worker -Q execute --concurrency=3 -l info -n execute@%h
+uv run celery -A config worker -Q execute -l info -n execute@%h   # concurrency from CELERY_WORKER_CONCURRENCY (default 1)
 docker compose up                      # web + celery + docker-socket-proxy + redis (+ optional sandbox dev container)
 ```
 
@@ -77,18 +77,21 @@ This changed recently; don't assume the Gateway owns the callback.
 ## Sandbox / container gotchas
 
 - One generic image (default tag `jiffy-sandbox:1.2.0`, from `SANDBOX_IMAGE`), built from `docker/sandbox/Dockerfile` on demand by `ensure_sandbox_image()` if missing. Bundles nvm/uv/gvm, node, python, go, gh/glab, git, curl, build-essential, iptables, pnpm, and the `opencode` CLI. Everything else is installed by the agent at runtime — there is no per-language image selection and no pre-container language check.
+- **Resource limits are env-driven** (`config/settings/base.py` → `jobs/execution/container.py`): `SANDBOX_MEMORY_LIMIT` (default `2g`), `SANDBOX_MEMORY_SWAP_LIMIT` (default `4g`, the *combined* mem+swap ceiling — must be ≥ the memory limit or the Gateway warns and uses 2× it; `-1` = unlimited), `SANDBOX_CPU_LIMIT` (default `1.5`, applied as `nano_cpus`, **not** `cpuset_cpus` — that used to pin a core index and couldn't express fractions). `SANDBOX_MEM_LIMIT` is kept as a backwards-compatible alias for `SANDBOX_MEMORY_LIMIT`.
+- Package installs are the usual OOM (exit 137) trigger. `build_package_manager_env()` puts `NODE_OPTIONS=--max-old-space-size=<SANDBOX_NODE_MAX_OLD_SPACE_MB or half the mem limit, floor 512>`, `npm_config_maxsockets/jobs`, `CARGO_BUILD_JOBS`, `MAKEFLAGS`, `GOMAXPROCS` (all from `SANDBOX_PACKAGE_CONCURRENCY`, default 2) into the container env at create time; `_apply_pnpm_limits()` rewrites `~/.config/pnpm/config.yaml` after start because pnpm v11 ignores `npm_config_*`. That one is best-effort and never fails the task.
 - The worker manages containers via the Docker SDK. **`DOCKER_HOST` must be set when the worker runs inside a container** (e.g. `tcp://docker-socket-proxy:2375`); `get_docker_client()` raises a clear error otherwise.
 - **Network egress is restricted by default** (`JIFFY_SANDBOX_NETWORK_RESTRICTED=true`): the container starts with `NET_ADMIN` and `iptables` default-deny OUTPUT, allowing only the allow-list hosts (resolved at start). **Fail-closed**: if the rules can't be applied the container is torn down and the task fails.
 - DNS is only allowed to Docker's embedded resolver `127.0.0.11`, which exists **only on user-defined networks** — so restricted containers are placed on `jiffy-sandbox-net` (created on demand). Don't move them to the default bridge while restriction is active.
 - Allow-list = `SANDBOX_NETWORK_ALLOWLIST` (defaults: PyPI, npm, crates.io, Go proxy, GitHub/GitLab/Gitea hosts) merged with `SANDBOX_NETWORK_ALLOWLIST_EXTRA` (self-hosted git + the LLM provider endpoint — both vary per install). `JIFFY_SANDBOX_NETWORK_RESTRICTED=false` = open network, for debugging only.
 - Containers are run `tty=True`, `remove=False` at create, then explicitly stopped+removed by the `start_generic_sandbox_container` context manager (`JIFFY_SANDBOX_CLEANUP=false` leaves them alive for debugging). Default user is non-root `jiffy`; the restriction script runs as root.
-- The `SANDBOX_OPENCODE_CONFIG_PATH` setting is **unused** — `_inject_opencode_config` hardcodes the project-root `opencode.json` and writes it to `/home/jiffy/.config/opencode/opencode.json` inside the container. Don't rely on that env var.
+- There is **no env var for the OpenCode config path** — `_inject_opencode_config` reads the project-root `opencode.json` and writes it to `/home/jiffy/.config/opencode/opencode.json` inside the container. (The old `SANDBOX_OPENCODE_CONFIG_PATH` setting was dead and has been removed.)
 - The agent runs as `opencode run --auto "$INSTRUCTIONS"` inside `bash -l -c` (login shell so `/etc/profile.d` version managers load), workdir `/workspace`, with the instructions staged to `/tmp/jiffy_instructions.txt` first. Agent stdout is redirected to the container's main stdout for live `docker logs`.
+- That exec is **detached** (`exec_create` + `exec_start(detach=True)`), then polled via `exec_inspect` every 5s until it finishes. Don't "simplify" it back to a blocking `exec_run`: that holds one Docker API connection open for the whole run, and `docker-socket-proxy` (HAProxy, `timeout client/server 10m`) cuts it at exactly 600s — docker-py then sees a clean EOF and `exec_inspect` still reports `Running`, which surfaced as the bogus `Agent exited with code None`. The run window is `SANDBOX_AGENT_TIMEOUT` (default 3600s), enforced by the Gateway itself; on timeout the task fails and the container teardown kills the run.
 - Clone injects the token into the URL: GitHub `token@host`, GitLab/Gitea `username:token@host`. The token is passed as container env `REPO_TOKEN` — never in the DB or baked into an image.
 
 ## Celery & worker
 
-- Celery app lives in `config/celery.py` and autodiscovers `jobs` + `apps.ingestion`. **The app module is `config`, not `jiffy`.** Single queue `execute`; keep concurrency low (3).
+- Celery app lives in `config/celery.py` and autodiscovers `jobs` + `apps.ingestion`. **The app module is `config`, not `jiffy`.** Single queue `execute`; concurrency comes from `CELERY_WORKER_CONCURRENCY` (settings → `worker_concurrency`, default 1) — the compose commands deliberately pass **no** `--concurrency` flag so the env var is what applies. Each slot can hold a full sandbox container, so size it as `concurrency × SANDBOX_MEMORY_LIMIT`.
 - `execute_task`: `bind=True, max_retries=3, default_retry_delay=60, acks_late=True`, routed to `execute`. Retries happen only on unexpected internal exceptions (transient errors); `ExecutionError` and agent/logical failures go straight to `failed` + callback with no retry.
 - On `worker_ready`, orphaned tasks still in `queued` status are re-dispatched (crash recovery). The startup `ensure_sandbox_image` call there is currently commented out; the image is still ensured per job.
 

@@ -36,13 +36,18 @@ DOCKER_EMBEDDED_DNS = "127.0.0.11"
 
 
 # Minimum request/socket timeout (seconds) for every Docker client the
-# Gateway creates. docker-py's own default (60s) is far shorter than a
-# legitimate agent run: a non-streaming ``exec_run`` blocks on a single HTTP
-# request for the whole duration of the command, so the client's timeout is
-# what actually determines how long a task is allowed to run before Docker
-# aborts it. A task must never be killed before it has had at least 15
-# minutes (900s) to complete.
+# Gateway creates. docker-py's own default (60s) is far shorter than the
+# slowest single call the Gateway makes (a sandbox image build), so it is
+# raised to 15 minutes. The agent run itself no longer depends on this: it is
+# executed detached and polled, so it is never bounded by a single request.
 MIN_DOCKER_CLIENT_TIMEOUT_SECONDS = 900
+
+# Agent run window used when neither the caller nor settings specify one.
+DEFAULT_AGENT_TIMEOUT_SECONDS = 3600
+# How often the detached agent exec is polled for completion, and how often a
+# still-running agent is reported in the log.
+AGENT_POLL_INTERVAL_SECONDS = 5
+AGENT_PROGRESS_LOG_INTERVAL_SECONDS = 300
 
 
 def get_docker_client(timeout_seconds: int | None = None) -> docker.DockerClient:
@@ -266,6 +271,203 @@ def _ensure_network(client: docker.DockerClient) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Resource limits
+# ---------------------------------------------------------------------------
+
+# Fallbacks used when a configured value is missing or unparseable.  They match
+# the settings defaults so a bad env var degrades to the documented behaviour
+# instead of to "no limit at all".
+DEFAULT_MEMORY_LIMIT = "2g"
+DEFAULT_CPU_LIMIT = 1.5
+
+_MEMORY_SUFFIX_MULTIPLIERS = {
+    "b": 1,
+    "k": 1024,
+    "m": 1024 ** 2,
+    "g": 1024 ** 3,
+}
+
+
+def parse_memory_bytes(value: Any) -> int | None:
+    """Parse a Docker memory size (``"512m"``, ``"2g"``, ``1073741824``) to bytes.
+
+    Returns ``-1`` for the "unlimited" sentinel and ``None`` if the value
+    cannot be parsed, so callers can fall back with a warning rather than
+    passing garbage to the Docker API.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value)
+
+    raw = str(value).strip().lower()
+    if not raw:
+        return None
+    if raw == "-1":
+        return -1
+
+    suffix = raw[-1]
+    if suffix in _MEMORY_SUFFIX_MULTIPLIERS:
+        number, multiplier = raw[:-1], _MEMORY_SUFFIX_MULTIPLIERS[suffix]
+    else:
+        number, multiplier = raw, 1
+    try:
+        return int(float(number) * multiplier)
+    except ValueError:
+        return None
+
+
+def resolve_memory_limits() -> tuple[str, int]:
+    """Return the ``(mem_limit, memswap_limit)`` pair for a sandbox container.
+
+    ``memswap_limit`` is the *combined* memory + swap ceiling, so Docker
+    requires it to be at least the memory limit.  When
+    ``SANDBOX_MEMORY_SWAP_LIMIT`` is unparseable or smaller than
+    ``SANDBOX_MEMORY_LIMIT`` we warn and fall back to twice the memory limit —
+    keeping some swap headroom rather than silently disabling it, since the
+    whole point of the setting is to stop installs being OOM-killed.
+    """
+    configured_mem = str(getattr(settings, "SANDBOX_MEMORY_LIMIT", DEFAULT_MEMORY_LIMIT)).strip()
+    mem_bytes = parse_memory_bytes(configured_mem)
+    if mem_bytes is None or mem_bytes <= 0:
+        logger.warning(
+            "SANDBOX_MEMORY_LIMIT=%r is not a valid Docker memory size — falling back to %s",
+            configured_mem,
+            DEFAULT_MEMORY_LIMIT,
+        )
+        configured_mem = DEFAULT_MEMORY_LIMIT
+        mem_bytes = parse_memory_bytes(DEFAULT_MEMORY_LIMIT)
+
+    configured_swap = str(getattr(settings, "SANDBOX_MEMORY_SWAP_LIMIT", "")).strip()
+    swap_bytes = parse_memory_bytes(configured_swap)
+    if swap_bytes == -1:
+        # Explicit "unlimited swap" — a valid Docker value, pass it through.
+        return configured_mem, -1
+    if swap_bytes is None or swap_bytes < mem_bytes:
+        fallback = mem_bytes * 2
+        logger.warning(
+            "SANDBOX_MEMORY_SWAP_LIMIT=%r must be a size >= SANDBOX_MEMORY_LIMIT (%s) — "
+            "falling back to 2x the memory limit (%d bytes)",
+            configured_swap,
+            configured_mem,
+            fallback,
+        )
+        swap_bytes = fallback
+    return configured_mem, swap_bytes
+
+
+def resolve_cpu_nano_cpus() -> int:
+    """Return the sandbox CPU quota as ``nano_cpus`` (cores x 1e9).
+
+    ``nano_cpus`` is the API equivalent of ``docker run --cpus``, so fractional
+    values like ``1.5`` work.  (The previous ``cpuset_cpus`` pinned the
+    container to a specific core index instead of capping its share, and could
+    not express a fraction at all.)
+    """
+    configured = str(getattr(settings, "SANDBOX_CPU_LIMIT", DEFAULT_CPU_LIMIT)).strip()
+    try:
+        cores = float(configured)
+        if cores <= 0:
+            raise ValueError(configured)
+    except ValueError:
+        logger.warning(
+            "SANDBOX_CPU_LIMIT=%r is not a positive number of cores — falling back to %s",
+            configured,
+            DEFAULT_CPU_LIMIT,
+        )
+        cores = DEFAULT_CPU_LIMIT
+    return int(cores * 1_000_000_000)
+
+
+def resolve_node_heap_mb(mem_limit: str) -> int:
+    """Return the Node.js old-space (heap) cap in MiB for the sandbox.
+
+    Uses ``SANDBOX_NODE_MAX_OLD_SPACE_MB`` when set; otherwise derives half of
+    the container memory limit (floor 512 MiB) so the heap cap tracks whatever
+    memory the container was given.  A Node heap that is allowed to grow past
+    the cgroup limit is the usual reason an install dies with exit 137.
+    """
+    configured = str(getattr(settings, "SANDBOX_NODE_MAX_OLD_SPACE_MB", "")).strip()
+    if configured:
+        try:
+            explicit = int(float(configured))
+            if explicit > 0:
+                return explicit
+        except ValueError:
+            pass
+        logger.warning(
+            "SANDBOX_NODE_MAX_OLD_SPACE_MB=%r is not a positive number of MiB — deriving from "
+            "the memory limit instead",
+            configured,
+        )
+
+    mem_bytes = parse_memory_bytes(mem_limit) or 0
+    if mem_bytes <= 0:
+        return 512
+    return max(512, int(mem_bytes / (1024 ** 2) / 2))
+
+
+def build_package_manager_env(mem_limit: str) -> Dict[str, str]:
+    """Environment variables that cap package-manager memory/parallelism.
+
+    Applied to the container at creation time so they are in effect for every
+    command the agent runs, including the install steps that trigger OOM kills
+    on small hosts.  npm reads ``npm_config_*``; ``NODE_OPTIONS`` caps the V8
+    heap for every Node process (npm/pnpm themselves included).
+    """
+    concurrency = int(getattr(settings, "SANDBOX_PACKAGE_CONCURRENCY", 2) or 2)
+    heap_mb = resolve_node_heap_mb(mem_limit)
+    return {
+        "NODE_OPTIONS": f"--max-old-space-size={heap_mb}",
+        "npm_config_maxsockets": str(concurrency),
+        "npm_config_jobs": str(concurrency),
+        "npm_config_fund": "false",
+        "npm_config_audit": "false",
+        "npm_config_progress": "false",
+        # Rust/Go build parallelism, for the same reason.
+        "CARGO_BUILD_JOBS": str(concurrency),
+        "MAKEFLAGS": f"-j{concurrency}",
+        "GOMAXPROCS": str(concurrency),
+    }
+
+
+# pnpm v11 reads network/concurrency settings only from its own global config
+# file, not from npm_config_* env vars — see docker/sandbox/Dockerfile.
+PNPM_CONFIG_PATH_IN_CONTAINER = "/home/jiffy/.config/pnpm/config.yaml"
+
+
+def _apply_pnpm_limits(container: Container, task_id: int = 0) -> None:
+    """Lower pnpm's install concurrency inside the container.
+
+    Best-effort: a failure here only means installs run at the image's default
+    parallelism, which is not worth failing the whole task over.
+    """
+    concurrency = int(getattr(settings, "SANDBOX_PACKAGE_CONCURRENCY", 2) or 2)
+    # Drop any existing networkConcurrency/childConcurrency lines from the
+    # image's baked-in config, then append the runtime values.
+    script = (
+        f"mkdir -p $(dirname {PNPM_CONFIG_PATH_IN_CONTAINER}) && "
+        f"touch {PNPM_CONFIG_PATH_IN_CONTAINER} && "
+        f"sed -i '/^\\(networkConcurrency\\|childConcurrency\\):/d' {PNPM_CONFIG_PATH_IN_CONTAINER} && "
+        f"printf 'networkConcurrency: %s\\nchildConcurrency: %s\\n' "
+        f"'{concurrency}' '{concurrency}' >> {PNPM_CONFIG_PATH_IN_CONTAINER}"
+    )
+    try:
+        exit_code, (_, err) = container.exec_run(cmd=["bash", "-c", script], demux=True)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("[%d] Failed to apply pnpm concurrency limits: %s", task_id, exc)
+        return
+    if exit_code != 0:
+        logger.warning(
+            "[%d] Failed to apply pnpm concurrency limits: %s",
+            task_id,
+            (err or b"").decode(errors="replace").strip(),
+        )
+    else:
+        logger.info("[%d] pnpm install concurrency limited to %d", task_id, concurrency)
+
+
+# ---------------------------------------------------------------------------
 # Config injection
 # ---------------------------------------------------------------------------
 
@@ -352,12 +554,16 @@ def start_generic_sandbox_container(
                 task_id,
             )
 
+        mem_limit, memswap_limit = resolve_memory_limits()
+        nano_cpus = resolve_cpu_nano_cpus()
+
         logger.info(
-            "[%d] Starting sandbox container (image=%s, mem=%s, cpus=%s)",
+            "[%d] Starting sandbox container (image=%s, mem=%s, mem+swap=%s, cpus=%.2f)",
             task_id,
             settings.SANDBOX_IMAGE,
-            settings.SANDBOX_MEM_LIMIT,
-            settings.SANDBOX_CPU_LIMIT,
+            mem_limit,
+            "unlimited" if memswap_limit == -1 else memswap_limit,
+            nano_cpus / 1_000_000_000,
         )
 
         # Surface the restriction config to the container so the startup
@@ -365,13 +571,19 @@ def start_generic_sandbox_container(
         container_env = dict(env_vars)
         container_env["JIFFY_SANDBOX_NETWORK_RESTRICTED"] = "true" if restricted else "false"
         container_env["JIFFY_SANDBOX_NETWORK_ALLOWLIST"] = ",".join(effective_allowlist)
+        # Cap package-manager memory/parallelism before anything runs inside.
+        container_env.update(build_package_manager_env(mem_limit))
 
         run_kwargs: Dict[str, Any] = {
             "detach": True,
             "remove": False,
             "tty": True,
-            "mem_limit": settings.SANDBOX_MEM_LIMIT,
-            "cpuset_cpus": str(settings.SANDBOX_CPU_LIMIT),
+            "mem_limit": mem_limit,
+            # Passed together with mem_limit: this is the combined memory+swap
+            # ceiling, so the container can spill into swap under pressure
+            # instead of being OOM-killed outright.
+            "memswap_limit": memswap_limit,
+            "nano_cpus": nano_cpus,
             "environment": container_env,
         }
         if restricted:
@@ -390,6 +602,10 @@ def start_generic_sandbox_container(
 
         # Inject OpenCode config into the sandbox container
         _inject_opencode_config(container, task_id)
+
+        # pnpm ignores npm_config_* env vars, so lower its concurrency in its
+        # own config file before the agent can run any install command.
+        _apply_pnpm_limits(container, task_id)
 
         # Apply egress restriction before handing the container to the job.
         # Fail closed: if the rules cannot be applied, raise so the job never
@@ -542,14 +758,67 @@ def _get_opencode_model(container: Container) -> str:
     return "unknown"
 
 
+def _wait_for_exec(
+        api_client: Any,
+        exec_id: str,
+        timeout_seconds: int,
+        task_id: int = 0,
+) -> int:
+    """Block until a detached exec finishes and return its exit code.
+
+    Polls ``exec_inspect`` instead of holding the exec's output stream open,
+    so no single request has to survive for the whole run (see
+    ``run_agent_in_container`` for why that matters).
+
+    Raises ``ContainerError`` if the exec is still running when
+    ``timeout_seconds`` elapses, or if Docker reports it as finished without
+    an exit code.
+    """
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    last_progress_log = started
+
+    while True:
+        info = api_client.exec_inspect(exec_id)
+        if not info.get("Running"):
+            exit_code = info.get("ExitCode")
+            if exit_code is None:
+                raise ContainerError(
+                    "Agent exec finished but Docker reported no exit code "
+                    f"(state: {info.get('Status') or 'unknown'})"
+                )
+            return int(exit_code)
+
+        now = time.monotonic()
+        remaining = deadline - now
+        if remaining <= 0:
+            raise ContainerError(
+                f"Agent did not finish within {timeout_seconds}s — giving up "
+                "(the container is torn down, which kills the run)"
+            )
+
+        if now - last_progress_log >= AGENT_PROGRESS_LOG_INTERVAL_SECONDS:
+            logger.info(
+                "[%d] Agent still running after %.0fs (%.0fs left of budget)",
+                task_id,
+                now - started,
+                remaining,
+            )
+            last_progress_log = now
+
+        time.sleep(min(AGENT_POLL_INTERVAL_SECONDS, remaining))
+
+
 def run_agent_in_container(
         container: Container,
         instructions: str,
         task_id: int = 0,
-        timeout_seconds: int = 3600,
+        timeout_seconds: int | None = None,
 ) -> None:
     """Run the coding agent inside the container with the given instructions."""
-    effective_timeout = max(timeout_seconds, MIN_DOCKER_CLIENT_TIMEOUT_SECONDS)
+    effective_timeout = timeout_seconds or getattr(
+        settings, "SANDBOX_AGENT_TIMEOUT_SECONDS", DEFAULT_AGENT_TIMEOUT_SECONDS
+    )
     model = _get_opencode_model(container)
     logger.info("[%d] Running agent in container %s (timeout=%ds, model=%s)", task_id, container.short_id,
                 effective_timeout, model)
@@ -575,23 +844,31 @@ def run_agent_in_container(
         'opencode run --auto "$INSTRUCTIONS" > /proc/1/fd/1 2>&1'
     )
 
-    # exec_run (non-streaming) blocks on a single HTTP request for the
-    # command's entire duration, so the Docker client's own request timeout
-    # is what actually enforces (or kills) the execution window. Bump it to
-    # the requested timeout for this call, then restore it, so the agent
-    # gets its full, guaranteed window rather than being cut off by
-    # whatever timeout the client happened to be created with.
+    # Start the agent *detached* and poll for completion instead of blocking on
+    # the exec's output stream.
+    #
+    # A non-detached exec holds one HTTP connection open for the command's
+    # entire duration, and that connection usually crosses a socket proxy:
+    # the compose stack's docker-socket-proxy (HAProxy) closes any connection
+    # after 10 minutes ("timeout client/server 10m"). When that happened,
+    # docker-py saw a clean EOF, the following exec_inspect still reported the
+    # exec as running, and the caller got the useless "Agent exited with code
+    # None" — while the agent itself was very much alive inside the container.
+    #
+    # Polling keeps every request short, so no proxy or client timeout can
+    # truncate a long run, and the execution window becomes a budget the
+    # Gateway enforces itself. Nothing is lost by detaching: the command
+    # already redirects all of its output to the container's main stdout for
+    # `docker logs`, and the real result is read from .jiffy_result.json.
     api_client = container.client.api
-    original_timeout = api_client.timeout
-    api_client.timeout = effective_timeout
-    try:
-        exit_code, (output, err) = container.exec_run(
-            cmd=["bash", "-l", "-c", run_cmd],
-            demux=True,
-            workdir=WORKSPACE,
-        )
-    finally:
-        api_client.timeout = original_timeout
+    exec_id = api_client.exec_create(
+        container.id,
+        cmd=["bash", "-l", "-c", run_cmd],
+        workdir=WORKSPACE,
+    )["Id"]
+    api_client.exec_start(exec_id, detach=True)
+
+    exit_code = _wait_for_exec(api_client, exec_id, effective_timeout, task_id=task_id)
 
     if exit_code != 0:
         raise ContainerError(

@@ -54,6 +54,7 @@ jobs:
           #   - full semver + major.minor for version tags
           #   - short commit SHA for every build (immutable reference)
           #   - "latest" for default-branch and tag pushes
+          #   - "dev" for builds from the develop branch
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
@@ -61,6 +62,7 @@ jobs:
             type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=${{ steps.version.outputs.app_version }},enable={{is_default_branch}}
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/develop' }}
 
       - name: Build and push image
         uses: docker/build-push-action@v7

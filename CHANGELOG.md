@@ -2,6 +2,73 @@
 
 <!-- version list -->
 
+## v0.2.0-rc.2 (2026-08-10)
+
+### Features
+
+- **install**: Ensure adequate host swap before starting Jiffy
+  ([`9d3f118`](https://github.com/Jiffy-Agnet/gateway/commit/9d3f11851e16c4819fa1937d04b79c984d60a46d))
+
+
+## v0.2.0-rc.1 (2026-08-10)
+
+### Bug Fixes
+
+- Run the agent exec detached and poll it instead of blocking
+  ([`c4e7e11`](https://github.com/Jiffy-Agnet/gateway/commit/c4e7e11737e8ab203acec9daf628ab2caeefcb3c))
+
+- **ci**: Revert setup-uv action version to v6 for compatibility
+  ([`0af34d0`](https://github.com/Jiffy-Agnet/gateway/commit/0af34d02cf6390401aee5b666019b99fffb66812))
+
+- **sandbox**: Detach the agent exec and poll it, with a Gateway-enforced timeout
+  ([`b4f5e04`](https://github.com/Jiffy-Agnet/gateway/commit/b4f5e04bc5e7f4a507352945287142e5843d5a37))
+
+### Documentation
+
+- Record why the agent exec must stay detached
+  ([`9595fd1`](https://github.com/Jiffy-Agnet/gateway/commit/9595fd10083b3455cbb2d81459773bde385b55ae))
+
+### Features
+
+- **sandbox**: Make the agent run window configurable via SANDBOX_AGENT_TIMEOUT
+  ([`1348939`](https://github.com/Jiffy-Agnet/gateway/commit/1348939e0a3f0f8e6973fa9ebe3ac6c4bc2ed49e))
+
+
+## v0.1.2-rc.5 (2026-08-09)
+
+
+## v0.1.2-rc.4 (2026-08-09)
+
+
+## v0.1.2-rc.3 (2026-08-09)
+
+### Bug Fixes
+
+- Update JIFFY_IMAGE_VERSION to JIFFY_GATEWAY_IMAGE_VERSION and adjust Docker image references
+  ([`75d1dce`](https://github.com/Jiffy-Agnet/gateway/commit/75d1dce7a9d9ffcfe04432b882090081c5357648))
+
+
+## v0.1.2-rc.2 (2026-08-09)
+
+### Bug Fixes
+
+- Correct syntax for JIFFY_IMAGE_VERSION in .env.example
+  ([`eeec7db`](https://github.com/Jiffy-Agnet/gateway/commit/eeec7dbb7c2053d7733c39bd73f31f53445a85af))
+
+
+## v0.1.2-rc.1 (2026-08-09)
+
+### Bug Fixes
+
+- Read JIFFY_GATEWAY_URL from vars, not secrets
+  ([`1ba8793`](https://github.com/Jiffy-Agnet/gateway/commit/1ba8793e3f97ee1cf2e006c35b214d9631a77c42))
+
+### Documentation
+
+- Fix JIFFY_GATEWAY_URL — variable, not secret
+  ([`c5b132e`](https://github.com/Jiffy-Agnet/gateway/commit/c5b132e453c782e774305233bfb5edc3cb3b2411))
+
+
 ## v0.1.1 (2026-08-06)
 
 

@@ -28,7 +28,7 @@ _allowed_hosts_raw = os.environ.get("ALLOWED_HOSTS", "")
 ALLOWED_HOSTS = [h.strip() for h in _allowed_hosts_raw.split(",") if h.strip()] if _allowed_hosts_raw else ["localhost", "127.0.0.1"]
 
 
-__version__ = "0.1.1"
+__version__ = "0.2.0-rc.2"
 
 def get_app_version():
     try:
@@ -117,15 +117,63 @@ CELERY_TASK_REJECT_ON_WORKER_LOST = True
 CELERY_TASK_ROUTES = {
     "jobs.tasks.execute_task": {"queue": "execute"},
 }
+# Number of task slots a worker process runs in parallel.  Celery reads this
+# (via the CELERY_ namespace → ``worker_concurrency``) at worker startup, so it
+# applies to `celery -A config worker` without a --concurrency flag; passing
+# --concurrency on the command line still wins over it.  Each slot can hold a
+# full sandbox container, so on constrained hosts keep this at 1 to serialise
+# execution and avoid OOM-killed sandboxes.
+try:
+    CELERY_WORKER_CONCURRENCY = max(1, int(os.environ.get("CELERY_WORKER_CONCURRENCY", "1")))
+except ValueError:
+    CELERY_WORKER_CONCURRENCY = 1
 
 # Redis
 REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
 
 # Sandbox container settings
 SANDBOX_IMAGE = os.environ.get("SANDBOX_IMAGE", "jiffy-sandbox:1.2.0")
-SANDBOX_MEM_LIMIT = os.environ.get("SANDBOX_MEM_LIMIT", "1g")
-SANDBOX_CPU_LIMIT = os.environ.get("SANDBOX_CPU_LIMIT", "1")
-SANDBOX_OPENCODE_CONFIG_PATH = os.environ.get("SANDBOX_OPENCODE_CONFIG_PATH", "")
+
+# Hard memory limit for a sandbox container (Docker size string: b/k/m/g).
+# ``SANDBOX_MEM_LIMIT`` is the older name and is still honoured as a fallback.
+SANDBOX_MEMORY_LIMIT = os.environ.get(
+    "SANDBOX_MEMORY_LIMIT",
+    os.environ.get("SANDBOX_MEM_LIMIT", "2g"),
+)
+# Combined memory + swap limit.  Docker requires this to be passed alongside
+# the memory limit; the difference between the two is how much the container
+# may spill into swap instead of being OOM-killed the moment RAM runs out.
+# MUST be >= SANDBOX_MEMORY_LIMIT — if it isn't, the Gateway logs a warning and
+# falls back to 2x the memory limit.  Use "-1" for unlimited swap.
+SANDBOX_MEMORY_SWAP_LIMIT = os.environ.get("SANDBOX_MEMORY_SWAP_LIMIT", "4g")
+# CPU quota for a sandbox container, in (fractional) cores — e.g. "1.5".
+SANDBOX_CPU_LIMIT = os.environ.get("SANDBOX_CPU_LIMIT", "1.5")
+# Backwards-compatible alias; prefer SANDBOX_MEMORY_LIMIT.
+SANDBOX_MEM_LIMIT = SANDBOX_MEMORY_LIMIT
+
+# --- Package-manager memory pressure inside the sandbox ---------------------
+# Heavy `npm install` / `pnpm install` runs are the usual cause of a sandbox
+# being OOM-killed (exit 137).  These caps are applied to the container's
+# environment (and pnpm's own config) before any install command runs.
+#
+# Node heap cap in MiB.  Empty/unset = derive it from SANDBOX_MEMORY_LIMIT
+# (half the container memory, floor 512 MiB) so it tracks the memory limit
+# automatically.
+SANDBOX_NODE_MAX_OLD_SPACE_MB = os.environ.get("SANDBOX_NODE_MAX_OLD_SPACE_MB", "").strip()
+# How many install/network/build jobs package managers may run in parallel.
+try:
+    SANDBOX_PACKAGE_CONCURRENCY = max(1, int(os.environ.get("SANDBOX_PACKAGE_CONCURRENCY", "2")))
+except ValueError:
+    SANDBOX_PACKAGE_CONCURRENCY = 2
+
+# How long a single agent run may take before the Gateway gives up on it.
+# Enforced by the Gateway itself (it polls the exec state), so it is a real
+# budget rather than a side effect of whatever request timeout the Docker
+# client or an intermediate socket proxy happens to use.
+try:
+    SANDBOX_AGENT_TIMEOUT_SECONDS = max(60, int(os.environ.get("SANDBOX_AGENT_TIMEOUT", "3600")))
+except ValueError:
+    SANDBOX_AGENT_TIMEOUT_SECONDS = 3600
 
 # Whether to stop and remove sandbox containers after each job.
 # Set to "false" to leave containers running for debugging.
