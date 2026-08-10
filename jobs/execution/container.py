@@ -36,13 +36,18 @@ DOCKER_EMBEDDED_DNS = "127.0.0.11"
 
 
 # Minimum request/socket timeout (seconds) for every Docker client the
-# Gateway creates. docker-py's own default (60s) is far shorter than a
-# legitimate agent run: a non-streaming ``exec_run`` blocks on a single HTTP
-# request for the whole duration of the command, so the client's timeout is
-# what actually determines how long a task is allowed to run before Docker
-# aborts it. A task must never be killed before it has had at least 15
-# minutes (900s) to complete.
+# Gateway creates. docker-py's own default (60s) is far shorter than the
+# slowest single call the Gateway makes (a sandbox image build), so it is
+# raised to 15 minutes. The agent run itself no longer depends on this: it is
+# executed detached and polled, so it is never bounded by a single request.
 MIN_DOCKER_CLIENT_TIMEOUT_SECONDS = 900
+
+# Agent run window used when neither the caller nor settings specify one.
+DEFAULT_AGENT_TIMEOUT_SECONDS = 3600
+# How often the detached agent exec is polled for completion, and how often a
+# still-running agent is reported in the log.
+AGENT_POLL_INTERVAL_SECONDS = 5
+AGENT_PROGRESS_LOG_INTERVAL_SECONDS = 300
 
 
 def get_docker_client(timeout_seconds: int | None = None) -> docker.DockerClient:
@@ -753,14 +758,67 @@ def _get_opencode_model(container: Container) -> str:
     return "unknown"
 
 
+def _wait_for_exec(
+        api_client: Any,
+        exec_id: str,
+        timeout_seconds: int,
+        task_id: int = 0,
+) -> int:
+    """Block until a detached exec finishes and return its exit code.
+
+    Polls ``exec_inspect`` instead of holding the exec's output stream open,
+    so no single request has to survive for the whole run (see
+    ``run_agent_in_container`` for why that matters).
+
+    Raises ``ContainerError`` if the exec is still running when
+    ``timeout_seconds`` elapses, or if Docker reports it as finished without
+    an exit code.
+    """
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    last_progress_log = started
+
+    while True:
+        info = api_client.exec_inspect(exec_id)
+        if not info.get("Running"):
+            exit_code = info.get("ExitCode")
+            if exit_code is None:
+                raise ContainerError(
+                    "Agent exec finished but Docker reported no exit code "
+                    f"(state: {info.get('Status') or 'unknown'})"
+                )
+            return int(exit_code)
+
+        now = time.monotonic()
+        remaining = deadline - now
+        if remaining <= 0:
+            raise ContainerError(
+                f"Agent did not finish within {timeout_seconds}s — giving up "
+                "(the container is torn down, which kills the run)"
+            )
+
+        if now - last_progress_log >= AGENT_PROGRESS_LOG_INTERVAL_SECONDS:
+            logger.info(
+                "[%d] Agent still running after %.0fs (%.0fs left of budget)",
+                task_id,
+                now - started,
+                remaining,
+            )
+            last_progress_log = now
+
+        time.sleep(min(AGENT_POLL_INTERVAL_SECONDS, remaining))
+
+
 def run_agent_in_container(
         container: Container,
         instructions: str,
         task_id: int = 0,
-        timeout_seconds: int = 3600,
+        timeout_seconds: int | None = None,
 ) -> None:
     """Run the coding agent inside the container with the given instructions."""
-    effective_timeout = max(timeout_seconds, MIN_DOCKER_CLIENT_TIMEOUT_SECONDS)
+    effective_timeout = timeout_seconds or getattr(
+        settings, "SANDBOX_AGENT_TIMEOUT_SECONDS", DEFAULT_AGENT_TIMEOUT_SECONDS
+    )
     model = _get_opencode_model(container)
     logger.info("[%d] Running agent in container %s (timeout=%ds, model=%s)", task_id, container.short_id,
                 effective_timeout, model)
@@ -786,23 +844,31 @@ def run_agent_in_container(
         'opencode run --auto "$INSTRUCTIONS" > /proc/1/fd/1 2>&1'
     )
 
-    # exec_run (non-streaming) blocks on a single HTTP request for the
-    # command's entire duration, so the Docker client's own request timeout
-    # is what actually enforces (or kills) the execution window. Bump it to
-    # the requested timeout for this call, then restore it, so the agent
-    # gets its full, guaranteed window rather than being cut off by
-    # whatever timeout the client happened to be created with.
+    # Start the agent *detached* and poll for completion instead of blocking on
+    # the exec's output stream.
+    #
+    # A non-detached exec holds one HTTP connection open for the command's
+    # entire duration, and that connection usually crosses a socket proxy:
+    # the compose stack's docker-socket-proxy (HAProxy) closes any connection
+    # after 10 minutes ("timeout client/server 10m"). When that happened,
+    # docker-py saw a clean EOF, the following exec_inspect still reported the
+    # exec as running, and the caller got the useless "Agent exited with code
+    # None" — while the agent itself was very much alive inside the container.
+    #
+    # Polling keeps every request short, so no proxy or client timeout can
+    # truncate a long run, and the execution window becomes a budget the
+    # Gateway enforces itself. Nothing is lost by detaching: the command
+    # already redirects all of its output to the container's main stdout for
+    # `docker logs`, and the real result is read from .jiffy_result.json.
     api_client = container.client.api
-    original_timeout = api_client.timeout
-    api_client.timeout = effective_timeout
-    try:
-        exit_code, (output, err) = container.exec_run(
-            cmd=["bash", "-l", "-c", run_cmd],
-            demux=True,
-            workdir=WORKSPACE,
-        )
-    finally:
-        api_client.timeout = original_timeout
+    exec_id = api_client.exec_create(
+        container.id,
+        cmd=["bash", "-l", "-c", run_cmd],
+        workdir=WORKSPACE,
+    )["Id"]
+    api_client.exec_start(exec_id, detach=True)
+
+    exit_code = _wait_for_exec(api_client, exec_id, effective_timeout, task_id=task_id)
 
     if exit_code != 0:
         raise ContainerError(
