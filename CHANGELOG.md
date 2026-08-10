@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.2.0-rc.2 (2026-08-10)
+
+### Features
+
+- **install**: Ensure adequate host swap before starting Jiffy
+  ([`9d3f118`](https://github.com/Jiffy-Agnet/gateway/commit/9d3f11851e16c4819fa1937d04b79c984d60a46d))
+
+
 ## v0.2.0-rc.1 (2026-08-10)
 
 ### Bug Fixes
