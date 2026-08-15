@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.2.1-rc.1 (2026-08-15)
+
+### Bug Fixes
+
+- **worker**: Stop losing tasks when the Task row is not readable
+  ([`76f0e3a`](https://github.com/Jiffy-Agnet/gateway/commit/76f0e3a64f1eedca34d92b8bf43227b4caa1a7ba))
+
+
 ## v0.2.0 (2026-08-10)
 
 
