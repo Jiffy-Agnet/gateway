@@ -12,6 +12,8 @@ services:
     environment:
       SECRET_KEY: ${SECRET_KEY}
       DEBUG: ${DEBUG}
+      # Both services must point at the same SQLite file (see .env.example).
+      DATABASE_PATH: ${DATABASE_PATH:-/app/data/db.sqlite3}
       ALLOWED_HOSTS: ${ALLOWED_HOSTS}
       REDIS_URL: ${REDIS_URL}
       REDIS_PASSWORD: ${REDIS_PASSWORD}
@@ -49,11 +51,16 @@ services:
     user: root
     volumes:
       - .:/app
+      # Same DB file as the web service — without this the worker migrates its
+      # own empty database and every job fails with "Task not found in DB".
+      - ./data:/app/data
       - ./opencode.json:/app/opencode.json
     environment:
       DOCKER_HOST: "tcp://docker-socket-proxy:2375"
       SECRET_KEY: ${SECRET_KEY}
       DEBUG: ${DEBUG}
+      # Both services must point at the same SQLite file (see .env.example).
+      DATABASE_PATH: ${DATABASE_PATH:-/app/data/db.sqlite3}
       ALLOWED_HOSTS: ${ALLOWED_HOSTS}
       REDIS_URL: ${REDIS_URL}
       REDIS_PASSWORD: ${REDIS_PASSWORD}

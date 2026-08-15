@@ -623,6 +623,7 @@ class ExecuteTaskTest(TestCase):
         self.assertEqual(task.status, "failed")
         self.assertIn("git clone failed", task.error_message)
 
+    @patch("jobs.tasks.TASK_LOOKUP_DELAY_SECONDS", 0)
     @patch("jobs.tasks.send_fallback_callback")
     @patch("jobs.tasks.load_payload_from_redis")
     def test_nonexistent_task_does_not_crash(self, mock_load, mock_cb):
@@ -631,6 +632,63 @@ class ExecuteTaskTest(TestCase):
         from jobs.tasks import execute_task
 
         execute_task(99999)
+
+    @patch("jobs.tasks.TASK_LOOKUP_DELAY_SECONDS", 0)
+    @patch("jobs.tasks.send_fallback_callback")
+    @patch("jobs.tasks.load_payload_from_redis")
+    def test_missing_task_row_reports_via_redis_payload(self, mock_load, mock_cb):
+        """A task whose row cannot be read still reports back to the issue."""
+        mock_load.return_value = self._make_payload(provider="github")
+
+        from jobs.tasks import execute_task
+
+        execute_task(99999)
+
+        mock_cb.assert_called_once()
+        reported_task = mock_cb.call_args.args[0]
+        self.assertEqual(reported_task.id, 99999)
+        self.assertEqual(reported_task.provider, "github")
+        self.assertEqual(reported_task.callback_url, "https://example.com/cb")
+        self.assertEqual(reported_task.callback_secret, "sec")
+        self.assertEqual(mock_cb.call_args.kwargs["status"], "failed")
+        # The transient instance must never be persisted.
+        self.assertFalse(Task.objects.filter(id=99999).exists())
+
+    @patch("jobs.tasks.TASK_LOOKUP_DELAY_SECONDS", 0)
+    @patch("jobs.tasks.send_fallback_callback")
+    @patch("jobs.tasks.load_payload_from_redis")
+    def test_missing_task_row_without_provider_is_not_reported(self, mock_load, mock_cb):
+        """No provider in the payload — log and give up rather than guess."""
+        mock_load.return_value = self._make_payload()
+
+        from jobs.tasks import execute_task
+
+        execute_task(99999)
+
+        mock_cb.assert_not_called()
+
+    @patch("jobs.tasks.TASK_LOOKUP_DELAY_SECONDS", 0)
+    def test_fetch_task_retries_until_the_row_is_visible(self):
+        """A row committed by another process just after the job was published."""
+        from jobs.tasks import TASK_LOOKUP_ATTEMPTS, _fetch_task
+
+        task = self._create_task()
+        real_get = Task.objects.get
+        calls = {"n": 0}
+
+        def flaky_get(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise Task.DoesNotExist()
+            return real_get(*args, **kwargs)
+
+        with patch.object(Task.objects, "get", side_effect=flaky_get):
+            found = _fetch_task(task.id)
+
+        self.assertIsNotNone(found)
+        self.assertEqual(found.id, task.id)
+        self.assertEqual(calls["n"], 3)
+        self.assertLessEqual(calls["n"], TASK_LOOKUP_ATTEMPTS)
 
     @patch("jobs.tasks.send_fallback_callback")
     @patch("jobs.tasks.ensure_sandbox_image")

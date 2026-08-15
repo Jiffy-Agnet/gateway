@@ -28,7 +28,7 @@ _allowed_hosts_raw = os.environ.get("ALLOWED_HOSTS", "")
 ALLOWED_HOSTS = [h.strip() for h in _allowed_hosts_raw.split(",") if h.strip()] if _allowed_hosts_raw else ["localhost", "127.0.0.1"]
 
 
-__version__ = "0.2.0-rc.2"
+__version__ = "0.2.0"
 
 def get_app_version():
     try:
@@ -100,11 +100,27 @@ WSGI_APPLICATION = 'config.wsgi.application'
 
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
+#
+# The web service writes the Task row and the Celery worker reads it back from
+# another container, so BOTH must resolve to the *same* file.  DATABASE_PATH
+# makes that explicit for deployments where /app is not a shared bind mount —
+# if the two services end up on different files the worker sees a migrated but
+# empty database and every job dies with "Task not found in DB".
+
+DATABASE_PATH = Path(os.environ.get("DATABASE_PATH") or BASE_DIR / "data" / "db.sqlite3")
 
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "data" / "db.sqlite3",
+        "NAME": DATABASE_PATH,
+        "OPTIONS": {
+            # WAL lets the worker read while the web process writes (and makes a
+            # freshly committed row immediately visible to the other process)
+            # instead of the two blocking each other on the rollback journal.
+            "init_command": "PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;",
+            # Wait for a busy writer rather than failing with "database is locked".
+            "timeout": 30,
+        },
     }
 }
 

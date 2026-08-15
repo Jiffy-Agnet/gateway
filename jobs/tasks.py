@@ -5,6 +5,8 @@ import time
 from typing import Any
 
 from celery import shared_task
+from django.conf import settings
+from django.db import connections
 
 from apps.ingestion.callback import send_fallback_callback
 from jobs.execution.agent import (
@@ -24,10 +26,103 @@ from jobs.utils.redis import load_payload_from_redis
 
 logger = logging.getLogger(__name__)
 
+# How hard the worker tries to read a Task row that the ingestion service has
+# already committed.  See ``_fetch_task``.
+TASK_LOOKUP_ATTEMPTS = 5
+TASK_LOOKUP_DELAY_SECONDS = 0.5
+# Delay before Celery re-delivers the job when the row is still missing after
+# the in-process attempts above.
+TASK_LOOKUP_RETRY_COUNTDOWN = 10
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _database_path() -> str:
+    """Path of the database this process is actually talking to."""
+    return str(settings.DATABASES["default"]["NAME"])
+
+
+def _task_row_count() -> str:
+    """Total Task rows, for diagnostics — never raises."""
+    try:
+        return str(Task.objects.count())
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        return f"unavailable ({exc})"
+
+
+def _fetch_task(task_id: int) -> Task | None:
+    """Load the Task row, tolerating a commit that is not visible yet.
+
+    Ingestion enqueues the job from ``transaction.on_commit``, so the row is
+    committed before the Celery message is published.  A worker in another
+    process can still miss it on the first read — a connection inherited across
+    the prefork fork, or a bind-mounted SQLite file that has not been re-read
+    yet — so retry a few times on a *fresh* connection before giving up.
+    """
+    for attempt in range(1, TASK_LOOKUP_ATTEMPTS + 1):
+        try:
+            return Task.objects.get(id=task_id)
+        except Task.DoesNotExist:
+            if attempt == TASK_LOOKUP_ATTEMPTS:
+                return None
+            logger.warning(
+                "[task_id=%d] Task row not visible yet (attempt %d/%d) — "
+                "reopening the DB connection and retrying",
+                task_id,
+                attempt,
+                TASK_LOOKUP_ATTEMPTS,
+            )
+            # Drop the connection so the next read cannot be served from a
+            # stale/forked one.
+            connections["default"].close()
+            time.sleep(TASK_LOOKUP_DELAY_SECONDS)
+    return None
+
+
+def _report_missing_task(task_id: int) -> None:
+    """Best-effort failure callback for a task whose DB row cannot be found.
+
+    Without the row there is no provider or callback URL in the DB, but the
+    ingestion payload in Redis carries both — so the issue thread gets a reply
+    instead of silence.  Every failure here is swallowed: this is already the
+    last-resort path.
+    """
+    try:
+        payload = load_payload_from_redis(task_id)
+        provider = payload.get("provider") or ""
+        callback = payload.get("callback") or {}
+        if not provider or not callback.get("url"):
+            logger.error(
+                "[task_id=%d] Cannot notify the issue thread: payload has no "
+                "provider/callback URL",
+                task_id,
+            )
+            return
+
+        # Unsaved instance — used only to build the callback request.
+        send_fallback_callback(
+            Task(
+                id=task_id,
+                provider=provider,
+                callback_url=callback["url"],
+                callback_secret=callback.get("secret", ""),
+                status="failed",
+            ),
+            status="failed",
+            error_message=(
+                "Internal Gateway error: the task record was not found by the "
+                "worker. Please retry the request."
+            ),
+        )
+    except Exception as exc:
+        logger.error(
+            "[task_id=%d] Could not send the missing-task callback: %s",
+            task_id,
+            exc,
+        )
 
 
 def _task_log(
@@ -153,10 +248,22 @@ def execute_task(self, task_id: int) -> None:
     start_time = time.monotonic()
 
     # --- Load task and payload ------------------------------------------------
-    try:
-        task = Task.objects.get(id=task_id)
-    except Task.DoesNotExist:
-        logger.error("[task_id=%d] Task not found in DB — skipping", task_id)
+    task = _fetch_task(task_id)
+    if task is None:
+        logger.error(
+            "[task_id=%d] Task not found in DB after %d attempts "
+            "(database=%s, task rows=%s). The worker and the ingestion service "
+            "must use the same database file — check that both containers mount "
+            "the same data volume (see DATABASE_PATH).",
+            task_id,
+            TASK_LOOKUP_ATTEMPTS,
+            _database_path(),
+            _task_row_count(),
+        )
+        # Give a slow/lagging commit one more chance before writing the task off.
+        if not self.request.called_directly and self.request.retries < self.max_retries:
+            raise self.retry(countdown=TASK_LOOKUP_RETRY_COUNTDOWN)
+        _report_missing_task(task_id)
         return
 
     _task_log(task_id, logging.INFO, "Task started", provider=task.provider)

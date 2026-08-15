@@ -4,7 +4,7 @@ import logging
 import os
 
 from celery import Celery
-from celery.signals import worker_ready
+from celery.signals import worker_process_init, worker_ready
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.base")
 
@@ -22,6 +22,21 @@ import jobs.tasks  # noqa: F401, E402
 logger = logging.getLogger(__name__)
 
 
+@worker_process_init.connect
+def close_inherited_db_connections(**kwargs: object) -> None:
+    """Drop DB connections inherited from the parent process after fork.
+
+    A prefork child inherits whatever connection the main process had open.
+    Reusing a SQLite connection across ``fork()`` is undefined behaviour and can
+    serve stale reads — a Task row committed by the web process after the fork
+    then looks like it does not exist.  Each child opens its own connection on
+    first use instead.
+    """
+    from django.db import connections
+
+    connections.close_all()
+
+
 @worker_ready.connect
 def on_worker_ready(**kwargs: object) -> None:
     """Run startup tasks after the worker is fully connected.
@@ -36,8 +51,26 @@ def on_worker_ready(**kwargs: object) -> None:
     - The broker connection is live, so ``apply_async`` will succeed.
     - It runs exactly once per worker process start.
     """
+    from django.conf import settings
+
     from jobs.execution.container import ensure_sandbox_image
     from jobs.models import Task
+
+    # --- 0. Which database is this worker actually reading? ------------------
+    # If this path (or the row count) does not match the web service, ingested
+    # tasks will never be found and every job dies with "Task not found in DB".
+    db_path = settings.DATABASES["default"]["NAME"]
+    try:
+        total_tasks = Task.objects.count()
+    except Exception:
+        logger.exception("Worker startup: task database %s is not readable", db_path)
+        total_tasks = -1
+    logger.info(
+        "Worker startup: task database=%s (%s task rows) — this must be the same "
+        "file the web service writes to",
+        db_path,
+        total_tasks if total_tasks >= 0 else "unknown",
+    )
 
     # --- 1. Sandbox image readiness ------------------------------------------
     # try:

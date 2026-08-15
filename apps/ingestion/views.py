@@ -81,9 +81,15 @@ def _handle_ingestion(provider: str, data: dict) -> Response:
             celery_task_id=task_id,
         )
 
-        _store_payload(task.id, validated)
+        # ``provider`` rides along in Redis so the worker can still report back
+        # to the issue thread if it cannot read the Task row.
+        _store_payload(task.id, {**validated, "provider": provider})
 
-    transaction.on_commit(lambda: execute_task.apply_async(args=[task.id], task_id=task_id))
+        # Registered inside the transaction so the job is only published once
+        # the row is actually committed and visible to the worker.
+        transaction.on_commit(
+            lambda: execute_task.apply_async(args=[task.id], task_id=task_id)
+        )
 
     logger.info(
         "Ingested %s issue %s as task %d (celery=%s)",
