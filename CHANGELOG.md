@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.3.0-rc.1 (2026-08-21)
+
+### Features
+
+- **env**: Update LLM provider credentials handling and add tests for environment variable
+  forwarding
+  ([`d1dbbb5`](https://github.com/Jiffy-Agnet/gateway/commit/d1dbbb5e2d61e8bffcaa8d3a4628d333ad49f735))
+
+
 ## v0.2.1-rc.1 (2026-08-15)
 
 ### Bug Fixes
