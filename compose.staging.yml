@@ -13,8 +13,9 @@ services:
     ports:
       - "${WEB_PORT:-8080}:8000"
     environment:
+      DJANGO_SETTINGS_MODULE: ${DJANGO_SETTINGS_MODULE:-config.settings.base}
       SECRET_KEY: ${SECRET_KEY}
-      DEBUG: ${DEBUG}
+      DEBUG: ${DEBUG:-False}
       # Both services must point at the same SQLite file (see .env.example).
       DATABASE_PATH: ${DATABASE_PATH:-/app/data/db.sqlite3}
       ALLOWED_HOSTS: ${ALLOWED_HOSTS}
@@ -22,7 +23,8 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       CELERY_BROKER_URL: ${CELERY_BROKER_URL}
       CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND}
-      X-JIFFY-TOKEN : ${X-JIFFY-TOKEN }
+      # Per-provider ingestion secrets, compared against the X-JIFFY-TOKEN
+      # request header.  Never share one value across providers.
       GITHUB_INGEST_TOKEN: ${GITHUB_INGEST_TOKEN}
       GITLAB_INGEST_TOKEN: ${GITLAB_INGEST_TOKEN}
       GITEA_INGEST_TOKEN: ${GITEA_INGEST_TOKEN}
@@ -65,8 +67,9 @@ services:
       - ./opencode.json:/app/opencode.json
     environment:
       DOCKER_HOST: "tcp://docker-socket-proxy:2375"
+      DJANGO_SETTINGS_MODULE: ${DJANGO_SETTINGS_MODULE:-config.settings.base}
       SECRET_KEY: ${SECRET_KEY}
-      DEBUG: ${DEBUG}
+      DEBUG: ${DEBUG:-False}
       # Both services must point at the same SQLite file (see .env.example).
       DATABASE_PATH: ${DATABASE_PATH:-/app/data/db.sqlite3}
       ALLOWED_HOSTS: ${ALLOWED_HOSTS}
@@ -74,7 +77,8 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       CELERY_BROKER_URL: ${CELERY_BROKER_URL}
       CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND}
-      X-JIFFY-TOKEN : ${X-JIFFY-TOKEN }
+      # Per-provider ingestion secrets, compared against the X-JIFFY-TOKEN
+      # request header.  Never share one value across providers.
       GITHUB_INGEST_TOKEN: ${GITHUB_INGEST_TOKEN}
       GITLAB_INGEST_TOKEN: ${GITLAB_INGEST_TOKEN}
       GITEA_INGEST_TOKEN: ${GITEA_INGEST_TOKEN}
@@ -91,8 +95,14 @@ services:
       SANDBOX_CPU_LIMIT: ${SANDBOX_CPU_LIMIT:-1.5}
       SANDBOX_NODE_MAX_OLD_SPACE_MB: ${SANDBOX_NODE_MAX_OLD_SPACE_MB:-}
       SANDBOX_PACKAGE_CONCURRENCY: ${SANDBOX_PACKAGE_CONCURRENCY:-2}
+      # Wall-clock budget for a single agent run, enforced by the Gateway.
+      SANDBOX_AGENT_TIMEOUT: ${SANDBOX_AGENT_TIMEOUT:-3600}
+      # Stop+remove the sandbox container after each job; "false" keeps it
+      # alive for debugging.
+      JIFFY_SANDBOX_CLEANUP: ${JIFFY_SANDBOX_CLEANUP:-true}
       # Task-execution parallelism (each slot can hold one sandbox container).
       CELERY_WORKER_CONCURRENCY: ${CELERY_WORKER_CONCURRENCY:-1}
+      # Forwarded into the sandbox via opencode.json for the coding agent.
       OPEN_API_BASE_URL: ${OPEN_API_BASE_URL}
       OPEN_API_KEY: ${OPEN_API_KEY}
     depends_on:
