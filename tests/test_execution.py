@@ -3,6 +3,7 @@ sandbox image management, and logging."""
 
 import json
 import logging
+import os
 from unittest.mock import MagicMock, patch
 
 from django.test import TestCase, override_settings
@@ -16,6 +17,7 @@ from jobs.execution.container import (
     _extract_git_host,
     _inject_token_into_url,
     _redact_url,
+    build_agent_provider_env,
     build_package_manager_env,
     ensure_sandbox_image,
     get_docker_client,
@@ -1126,6 +1128,33 @@ class PackageManagerLimitsTest(TestCase):
         self.assertEqual(env["CARGO_BUILD_JOBS"], "2")
         self.assertEqual(env["MAKEFLAGS"], "-j2")
         self.assertEqual(env["GOMAXPROCS"], "2")
+
+    @override_settings(SANDBOX_AGENT_ENV_PASSTHROUGH=("OPEN_API_BASE_URL", "OPEN_API_KEY"))
+    def test_provider_env_forwarded(self):
+        with patch.dict(
+            os.environ,
+            {"OPEN_API_BASE_URL": "https://llm.example/v1", "OPEN_API_KEY": "sk-test"},
+        ):
+            env = build_agent_provider_env()
+        self.assertEqual(
+            env,
+            {"OPEN_API_BASE_URL": "https://llm.example/v1", "OPEN_API_KEY": "sk-test"},
+        )
+
+    @override_settings(SANDBOX_AGENT_ENV_PASSTHROUGH=("OPEN_API_BASE_URL", "OPEN_API_KEY"))
+    def test_provider_env_skips_blank_values(self):
+        with patch.dict(
+            os.environ,
+            {"OPEN_API_BASE_URL": "https://llm.example/v1", "OPEN_API_KEY": "   "},
+        ):
+            env = build_agent_provider_env()
+        self.assertEqual(env, {"OPEN_API_BASE_URL": "https://llm.example/v1"})
+
+    @override_settings(SANDBOX_AGENT_ENV_PASSTHROUGH=("OPEN_API_BASE_URL", "OPEN_API_KEY"))
+    def test_provider_env_absent_is_not_an_error(self):
+        """The provider vars are optional — unset means "forward nothing"."""
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(build_agent_provider_env(), {})
 
     @override_settings(SANDBOX_PACKAGE_CONCURRENCY=1)
     def test_pnpm_config_rewritten(self):

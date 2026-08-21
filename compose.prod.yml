@@ -24,8 +24,8 @@ services:
       GITHUB_INGEST_TOKEN: ${GITHUB_INGEST_TOKEN}
       GITLAB_INGEST_TOKEN: ${GITLAB_INGEST_TOKEN}
       GITEA_INGEST_TOKEN: ${GITEA_INGEST_TOKEN}
-      OPEN_API_BASE_URL: ${OPEN_API_BASE_URL}
-      OPEN_API_KEY: ${OPEN_API_KEY}
+      OPEN_API_BASE_URL: ${OPEN_API_BASE_URL:-}
+      OPEN_API_KEY: ${OPEN_API_KEY:-}
     depends_on:
       redis:
         condition: service_healthy
@@ -96,8 +96,8 @@ services:
       # Task-execution parallelism (each slot can hold one sandbox container).
       CELERY_WORKER_CONCURRENCY: ${CELERY_WORKER_CONCURRENCY:-1}
       # Forwarded into the sandbox via opencode.json for the coding agent.
-      OPEN_API_BASE_URL: ${OPEN_API_BASE_URL}
-      OPEN_API_KEY: ${OPEN_API_KEY}
+      OPEN_API_BASE_URL: ${OPEN_API_BASE_URL:-}
+      OPEN_API_KEY: ${OPEN_API_KEY:-}
     depends_on:
       redis:
         condition: service_healthy

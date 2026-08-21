@@ -167,6 +167,13 @@ SANDBOX_CPU_LIMIT = os.environ.get("SANDBOX_CPU_LIMIT", "1.5")
 # Backwards-compatible alias; prefer SANDBOX_MEMORY_LIMIT.
 SANDBOX_MEM_LIMIT = SANDBOX_MEMORY_LIMIT
 
+# --- LLM provider credentials forwarded into the sandbox --------------------
+# `opencode.json` (injected into the container by _inject_opencode_config)
+# references these, so the agent process needs them in its environment.
+# They are passed as container env only — never persisted to the DB or baked
+# into the image.  Unset/blank values are simply not forwarded.
+SANDBOX_AGENT_ENV_PASSTHROUGH = ("OPEN_API_BASE_URL", "OPEN_API_KEY")
+
 # --- Package-manager memory pressure inside the sandbox ---------------------
 # Heavy `npm install` / `pnpm install` runs are the usual cause of a sandbox
 # being OOM-killed (exit 137).  These caps are applied to the container's

@@ -407,6 +407,21 @@ def resolve_node_heap_mb(mem_limit: str) -> int:
     return max(512, int(mem_bytes / (1024 ** 2) / 2))
 
 
+def build_agent_provider_env() -> Dict[str, str]:
+    """Env vars the agent's LLM provider config (``opencode.json``) reads.
+
+    Taken from the Gateway process environment and passed straight through to
+    the container.  Blank/unset names are skipped so the sandbox never gets an
+    empty API key that looks configured.
+    """
+    provider_env: Dict[str, str] = {}
+    for name in getattr(settings, "SANDBOX_AGENT_ENV_PASSTHROUGH", ()):
+        value = os.environ.get(name, "").strip()
+        if value:
+            provider_env[name] = value
+    return provider_env
+
+
 def build_package_manager_env(mem_limit: str) -> Dict[str, str]:
     """Environment variables that cap package-manager memory/parallelism.
 
@@ -573,6 +588,8 @@ def start_generic_sandbox_container(
         container_env["JIFFY_SANDBOX_NETWORK_ALLOWLIST"] = ",".join(effective_allowlist)
         # Cap package-manager memory/parallelism before anything runs inside.
         container_env.update(build_package_manager_env(mem_limit))
+        # Forward the LLM provider credentials the injected opencode.json needs.
+        container_env.update(build_agent_provider_env())
 
         run_kwargs: Dict[str, Any] = {
             "detach": True,
