@@ -358,8 +358,17 @@ def execute_task(self, task_id: int) -> None:
 
             # Running — agent does everything from here
             _update_status(task, "running")
-            _task_log(task_id, logging.INFO, "Status → running — handing off to agent", provider=task.provider)
             instructions = build_agent_instructions(payload)
+            # Size is logged so a prompt that arrives at the agent truncated is
+            # visible in one line rather than inferred from the agent asking
+            # what the task was.
+            _task_log(
+                task_id,
+                logging.INFO,
+                "Status → running — handing off to agent (%d bytes of instructions)",
+                len(instructions.encode("utf-8")),
+                provider=task.provider,
+            )
             run_agent_in_container(container, instructions, task_id=task_id)
 
             # Read result

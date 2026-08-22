@@ -6,7 +6,9 @@ from typing import Any, Dict, NamedTuple
 
 from docker.models.containers import Container
 
+from apps.ingestion.callback import QUESTION_TAG
 from jobs.callback_specs import get_callback_spec
+from jobs.execution.container import INSTRUCTIONS_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +18,13 @@ AGENT_RESULT_PATH = "/workspace/.jiffy_result.json"
 # ended because the agent needs an answer from the requester before it can
 # continue — it is neither a success nor a failure.
 VALID_AGENT_STATUSES = ("done", "failed", "question")
+
+# The issue text is fenced by these markers so the agent can tell a short
+# request apart from a truncated one. Seeing the end marker is proof it got
+# the whole thread — which is what stops it asking the requester to "re-send
+# the task", the one question that is never worth a round trip.
+ISSUE_BEGIN_MARKER = "<<<JIFFY-ISSUE-BEGIN>>>"
+ISSUE_END_MARKER = "<<<JIFFY-ISSUE-END>>>"
 
 
 class AgentResult(NamedTuple):
@@ -49,8 +58,18 @@ def _extract_issue_text(payload: Dict[str, Any]) -> str:
     issue = payload.get("issue", {})
     turns = issue.get("turns")
     if turns and isinstance(turns, list) and len(turns) > 0:
-        return _format_turns(turns)
-    return issue.get("text", "")
+        text = _format_turns(turns)
+    else:
+        text = issue.get("text", "")
+    if not text.strip():
+        # The agent is about to be handed an empty request, which is the one
+        # thing guaranteed to make it ask what the task is. Say so here, where
+        # it is a Gateway/edge bug and not the requester's fault.
+        logger.warning(
+            "Issue %s produced no text — the agent will receive an empty request",
+            issue.get("external_issue_id", "?"),
+        )
+    return text
 
 
 # Matches a "Suggested codebase areas" section header (with or without a
@@ -126,12 +145,18 @@ You are a coding agent working in an isolated sandbox environment.
 
 ## Issue / Request
 
-The following is the full, verbatim text of the task you must complete. Do not
-summarize or pre-parse it — implement exactly what it asks for.
+Between the two markers below is the full, verbatim text of the task you must
+complete. Do not summarize or pre-parse it — implement exactly what it asks for.
 
----
+The markers are an integrity check: if you can see `{ISSUE_END_MARKER}`, you have
+the whole request, however short it looks, and there is nothing missing to ask
+about. If the end marker is absent, your copy was truncated in transit — read
+the complete text from `{INSTRUCTIONS_PATH}` and work from that instead. Either
+way, never ask the requester to re-send or complete the task text.
+
+{ISSUE_BEGIN_MARKER}
 {issue_text}
----
+{ISSUE_END_MARKER}
 
 ## Working Directory
 
@@ -185,35 +210,65 @@ You own the entire rest of the workflow. Specifically:
    or partially succeeded), you MUST attempt to call the callback endpoint to
    report your result. See "Callback Delivery" below for details.
 
-## Asking a Question
+## Asking a Question — Last Resort Only
 
-Nobody is watching your terminal, and there is no interactive prompt: anything
-you ask that is not delivered through the callback is lost. So if at any point
-you have a question — the request is ambiguous, it contradicts the codebase, it
-needs a credential or a decision you cannot make, or you would otherwise have to
-guess at something that changes what you build — you must ask it by reporting a
-`question` result. Never guess silently, and never end a run leaving a question
-only in your logs or your summary.
+Asking costs the requester a round trip and stalls the task until a human comes
+back, so a question is a failure to be avoided, not a safety net. **Do the work.**
+Almost everything that feels like a question is answerable from the repository
+in front of you: existing patterns, tests, config, README, git history, and the
+conventions the codebase already follows are the answer to "which way should I
+do this?". Read before you ask.
 
-Ask only about what actually blocks you, and ask it in full: state what you
-already tried and understood, then the specific thing you need decided. Prefer
-concrete options ("A or B?") over open questions where you can. Group everything
-you need into one message — you get one reply, and it arrives as a brand-new
-task, not as a continuation of this run.
+Before you even consider asking, you must have done all of these:
+
+1. **Searched the repository** for the answer — an existing implementation of
+   something similar is a decision already made for you.
+2. **Done every part of the task that does not depend on the answer.** A
+   question about one detail is not a reason to stop on everything else.
+3. **Looked for a reasonable default.** If one interpretation is clearly the
+   most sensible, take it, implement it, and write down the assumption in your
+   `summary` and `technical_report`. A delivered change under a stated
+   assumption is far more useful than a question. The requester can correct a
+   stated assumption in one reply; they cannot use an empty branch.
+4. **Checked that the answer would actually change what you build.** If both
+   readings lead to the same code, there is nothing to ask.
+
+Only ask when, after all of that, proceeding would be actively harmful or
+useless: it would destroy data or break production, it needs a credential or an
+external decision you cannot obtain, or the request has two plausible readings
+that lead to genuinely different work and nothing in the repo favours either.
+
+Never ask about the task text itself. In particular, never ask the requester to
+re-send, repeat, clarify or "complete" the issue text on the grounds that what
+you received looks short, cut off, or incomplete. The complete, verbatim text
+is always on disk at `{INSTRUCTIONS_PATH}`, and the issue section above is
+delimited by explicit `{ISSUE_BEGIN_MARKER}` / `{ISSUE_END_MARKER}` markers. If you
+do not see the end marker, your copy of the prompt was truncated in transit —
+read `{INSTRUCTIONS_PATH}` in full and work from that. If the text genuinely is
+short, that is simply how the requester wrote it: treat it as the whole request
+and implement it.
+
+If you do have to ask, ask well: one message covering everything you need, each
+question stated with what you already tried and understood, and concrete options
+("A or B?") rather than an open-ended prompt. You get exactly one reply, and it
+arrives as a brand-new task rather than a continuation of this run, so the
+question must stand on its own.
 
 To ask:
 
 - Set `status` to `"question"` in your result file and put the question text in
   the `question` field.
 - Deliver it through the callback using the question format below, so it is
-  posted as a reply on the issue thread the request came from.
+  posted as a reply on the issue thread the request came from. It must carry
+  the `{QUESTION_TAG}` tag as documented there — that tag is how the thread and
+  the next run recognise the comment as a question rather than a result.
 - Commit and push whatever partial, coherent work you already have (if any) so
   it is not lost, and report the branch. Do not open a PR for incomplete work
   unless the issue text asked for one.
 
-The requester answers by replying on the issue, which starts a new task with the
-full thread — including your question and their answer — so write the question
-to be understandable on its own.
+Anything you ask that is not delivered through the callback is lost — nobody is
+watching your terminal and there is no interactive prompt. So a question left in
+your logs, or in your summary, is a question nobody will ever answer.
 
 ## Callback Delivery
 
@@ -252,7 +307,7 @@ Task #<task_id>: ❌ Jiffy could not complete this task.
 For a task that is blocked on a question (see "Asking a Question" above):
 
 ```
-Task #<task_id>: ❓ Jiffy has a question before continuing.
+{QUESTION_TAG} Task #<task_id>: ❓ Jiffy has a question before continuing.
 
 **Question:** <question>
 
@@ -269,6 +324,7 @@ Rules:
 - If `branch_name` is null/empty, omit the **Branch:** line entirely.
 - If `technical_report` is missing or empty, omit the entire `Technical Report` section (including the `---` separator and heading) entirely.
 - In the question format, omit the **Branch:** line if you have no branch to report; keep the closing "Reply on this issue" note always.
+- The question format's leading `{QUESTION_TAG}` tag is mandatory and must be the first thing on the first line, exactly as written. It is what marks the comment as a question rather than a result; the success and failure formats must never carry it.
 - The `technical_report` field, when present, must use the following structure:
 
   ## What was done

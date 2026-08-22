@@ -8,8 +8,18 @@ from unittest.mock import MagicMock, patch
 
 from django.test import TestCase, override_settings
 
-from jobs.execution.agent import AgentResult, build_agent_instructions, read_agent_result, _extract_issue_text, _format_turns
+from apps.ingestion.callback import QUESTION_TAG, format_callback_body
+from jobs.execution.agent import (
+    ISSUE_BEGIN_MARKER,
+    ISSUE_END_MARKER,
+    AgentResult,
+    build_agent_instructions,
+    read_agent_result,
+    _extract_issue_text,
+    _format_turns,
+)
 from jobs.execution.container import (
+    INSTRUCTIONS_PATH,
     _apply_network_restriction,
     _apply_pnpm_limits,
     _build_network_restriction_script,
@@ -1410,16 +1420,75 @@ class AgentQuestionTest(TestCase):
         self.assertIsNone(result.question)
         self.assertIn("question", result.error_message)
 
-    def test_instructions_tell_the_agent_how_to_ask(self):
-        instructions = build_agent_instructions({
+    def _instructions(self, text="Do the thing"):
+        return build_agent_instructions({
             "repo": {"url": "https://github.com/user/repo"},
-            "issue": {"text": "Do the thing", "external_issue_id": "1"},
+            "issue": {"text": text, "external_issue_id": "1"},
             "callback": {"url": "https://example.com/cb", "secret": "sec"},
         })
+
+    def test_instructions_tell_the_agent_how_to_ask(self):
+        instructions = self._instructions()
         self.assertIn("## Asking a Question", instructions)
         self.assertIn('`"question"`', instructions)
-        self.assertIn("Never guess silently", instructions)
         self.assertIn("❓ Jiffy has a question before continuing.", instructions)
+
+    def test_instructions_make_asking_a_last_resort(self):
+        """Asking costs a human round trip, so the prompt must push back on it."""
+        instructions = self._instructions()
+        section = instructions[instructions.index("## Asking a Question"):]
+        section = section[: section.index("## Callback Delivery")]
+        for expected in (
+            "Last Resort Only",
+            "Searched the repository",
+            "does not depend on the answer",
+            "reasonable default",
+            "write down the assumption",
+        ):
+            self.assertIn(expected, section)
+
+    def test_instructions_forbid_asking_about_a_truncated_prompt(self):
+        """The one question never worth asking: "re-send me the task"."""
+        instructions = self._instructions()
+        self.assertIn("never ask the requester to re-send", instructions)
+        self.assertIn("looks short, cut off, or incomplete", instructions)
+        self.assertIn(INSTRUCTIONS_PATH, instructions)
+
+    def test_issue_text_is_fenced_by_integrity_markers(self):
+        """Seeing the end marker is how the agent knows nothing was truncated."""
+        instructions = self._instructions("Fix the login bug")
+        fenced = instructions.split(ISSUE_BEGIN_MARKER)[1].split(ISSUE_END_MARKER)[0]
+        self.assertEqual(fenced.strip(), "Fix the login bug")
+
+    def test_a_huge_thread_is_still_fully_fenced(self):
+        body = "line of issue text\n" * 100_000
+        instructions = self._instructions(body)
+        fenced = instructions.split(ISSUE_BEGIN_MARKER)[1].split(ISSUE_END_MARKER)[0]
+        self.assertEqual(fenced.strip(), body.strip())
+
+    def test_empty_issue_text_is_flagged_by_the_gateway(self):
+        """An empty request is a Gateway/edge bug, not something to ask about."""
+        with self.assertLogs("jobs.execution.agent", level="WARNING") as cm:
+            _extract_issue_text({"issue": {"text": "   ", "external_issue_id": "55"}})
+        self.assertIn("produced no text", "".join(cm.output))
+
+    def test_question_body_carries_the_tag(self):
+        body = format_callback_body(
+            task_id=3, status="question", question="Which cache backend?"
+        )
+        self.assertTrue(body.startswith(QUESTION_TAG))
+
+    def test_result_bodies_do_not_carry_the_question_tag(self):
+        for status in ("done", "failed"):
+            body = format_callback_body(
+                task_id=3, status=status, summary="ok", error_message="bad"
+            )
+            self.assertNotIn(QUESTION_TAG, body)
+
+    def test_instructions_require_the_tag_on_the_question_comment(self):
+        instructions = self._instructions()
+        self.assertIn(f"{QUESTION_TAG} Task #<task_id>: ❓", instructions)
+        self.assertIn("tag is mandatory", instructions)
 
     @patch("jobs.tasks.send_fallback_callback")
     @patch("jobs.tasks.ensure_sandbox_image")

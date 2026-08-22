@@ -25,6 +25,12 @@ MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 2
 
 
+# Marks a comment as a question rather than a result. Kept on the first line and
+# stable across providers so a reader — a human scanning the thread, the edge, or
+# the next run reading its own earlier turn — can tell the two apart without
+# parsing the prose.
+QUESTION_TAG = "[JIFFY:QUESTION]"
+
 QUESTION_REPLY_HINT = (
     "Reply on this issue to answer — your reply starts a new Jiffy task with "
     "the full thread."
@@ -61,7 +67,7 @@ def format_callback_body(
         # back as a comment on the originating issue; the answer arrives as a
         # reply, which the edge picks up as a brand-new task.
         lines = [
-            f"Task #{task_id}: ❓ Jiffy has a question before continuing.",
+            f"{QUESTION_TAG} Task #{task_id}: ❓ Jiffy has a question before continuing.",
             "",
             f"**Question:** {question or 'No question text was provided.'}",
         ]
