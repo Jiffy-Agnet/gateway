@@ -8,7 +8,7 @@ from docker.models.containers import Container
 
 from apps.ingestion.callback import QUESTION_TAG
 from jobs.callback_specs import get_callback_spec
-from jobs.execution.container import INSTRUCTIONS_PATH
+from jobs.execution.container import CALLBACK_SCRIPT_PATH, INSTRUCTIONS_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -206,9 +206,9 @@ You own the entire rest of the workflow. Specifically:
    review* — include a mention of the configured code-review bot handle in the
    PR description (if you opened a PR) or in your final result summary (if you
    did not).
-8. **Callback attempt** — *after* completing the above (whether you succeeded
-   or partially succeeded), you MUST attempt to call the callback endpoint to
-   report your result. See "Callback Delivery" below for details.
+8. **Report back** — *after* completing the above (whether you succeeded or
+   partially succeeded), you MUST run the staged callback wrapper to post your
+   result to the issue thread. See "Callback Delivery" below for details.
 
 ## Asking a Question — Last Resort Only
 
@@ -272,14 +272,41 @@ your logs, or in your summary, is a question nobody will ever answer.
 
 ## Callback Delivery
 
-You MUST attempt exactly ONE call to the callback endpoint after finishing
-your work. Make exactly ONE attempt — do not retry. If the call fails, report
-that in your result's `callback` object.
+After finishing your work you MUST report it back to the issue thread. You do
+**not** write the HTTP call yourself: a wrapper is already staged in this
+container that owns delivery, including retries. Your job is to compose the
+comment body and run the wrapper once.
 
-The report you send must be **human-readable markdown** suitable for posting
-as an issue/PR comment. Compose it in the format below, then send it exactly
-as described under "Callback endpoint details" — that section says whether it
-goes on the wire as raw text or wrapped in a JSON field.
+    1. Write your comment body (the markdown described below) to a file, e.g.
+       /tmp/jiffy_callback_body.md
+    2. Run:  python3 {CALLBACK_SCRIPT_PATH} --body-file /tmp/jiffy_callback_body.md
+    3. Copy the single JSON object it prints on stdout verbatim into the
+       `callback` field of your result file.
+
+Rules for this step, all of them absolute:
+
+- Run the wrapper **exactly once**. It already retries transient failures on
+  its own schedule and gives up on permanent ones; running it again would post
+  a duplicate comment.
+- Do **not** write your own HTTP request, curl command, or retry loop for the
+  callback, and do not change the endpoint, headers or secret. Delivery policy
+  is not yours to decide — the wrapper is the only correct way to report.
+- Do **not** invent the `callback` object. Use exactly what the wrapper
+  printed. If the wrapper could not run at all (exit code 2), report
+  `{{"attempted": false, "succeeded": false, "error": "<what went wrong>"}}`.
+- A failed callback does **not** change your `status`. If you completed the
+  work, `status` stays `"done"` even when the comment could not be posted; the
+  Gateway notices the undelivered callback and reports it for you.
+- Still write your result file either way. It is read from the container's
+  filesystem, not over the network, so it survives any delivery failure.
+
+The wrapper prints each attempt to stderr, which is already redirected to the
+container's log, so you do not need to add logging of your own.
+
+The report you compose must be **human-readable markdown** suitable for posting
+as an issue/PR comment. Use the format below. The endpoint details at the end
+of this section are documentation of what the wrapper does — you do not need to
+apply them yourself.
 
 For a successful task:
 
@@ -346,7 +373,7 @@ Rules:
 
 - Use the task ID from your environment if available, or 0 as a fallback.
 
-Callback endpoint details:
+Callback endpoint details (what the wrapper sends — for reference only):
 - **URL**: {callback_url}
 - **Method**: {spec['method']}
 - **Auth header**: `{spec['auth_header']}: {spec['auth_value_prefix']}<callback_secret>`

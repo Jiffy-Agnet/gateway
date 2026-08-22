@@ -10,6 +10,14 @@ from typing import TYPE_CHECKING, Any
 
 import requests
 
+from jobs.callback_retry import (
+    BASE_DELAY_SECONDS,
+    MAX_ATTEMPTS,
+    TIMEOUT_SECONDS,
+    delay_before_attempt,
+    is_success,
+    is_transient_status,
+)
 from jobs.callback_specs import (
     build_callback_body,
     build_callback_headers,
@@ -21,8 +29,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 3
-RETRY_DELAY_SECONDS = 2
+# Kept as module-level names for backwards compatibility; the values now come
+# from the shared policy so the Gateway and the sandbox wrapper retry alike.
+MAX_RETRIES = MAX_ATTEMPTS
+RETRY_DELAY_SECONDS = BASE_DELAY_SECONDS
 
 
 # Marks a comment as a question rather than a result. Kept on the first line and
@@ -230,42 +240,72 @@ def _send_callback_via_spec(
     headers = build_callback_headers(spec, callback_secret)
     body = build_callback_body(spec, body_text)
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    last_error = "no attempt was made"
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        delay = delay_before_attempt(attempt)
+        if delay:
+            logger.info(
+                "Callback for task %d: waiting %.1fs before attempt %d/%d",
+                task_id,
+                delay,
+                attempt,
+                MAX_ATTEMPTS,
+            )
+            time.sleep(delay)
+
         try:
             response = requests.request(
-                method, url, data=body, headers=headers, timeout=30
+                method, url, data=body, headers=headers, timeout=TIMEOUT_SECONDS
             )
-            if response.status_code < 300:
+            if is_success(response.status_code):
                 logger.info(
-                    "Callback delivered for task %d (attempt %d)",
+                    "Callback delivered for task %d on attempt %d/%d (HTTP %d)",
                     task_id,
                     attempt,
+                    MAX_ATTEMPTS,
+                    response.status_code,
+                )
+                return
+            last_error = f"HTTP {response.status_code}"
+            if not is_transient_status(response.status_code):
+                # A rejected secret or a missing issue answers the same way
+                # however many times it is asked. Fail now rather than spend
+                # the retry budget confirming it.
+                logger.error(
+                    "Callback for task %d returned %d on attempt %d/%d — client "
+                    "error, not retrying. callback_url=%s, status=%s",
+                    task_id,
+                    response.status_code,
+                    attempt,
+                    MAX_ATTEMPTS,
+                    callback_url,
+                    status,
                 )
                 return
             logger.warning(
-                "Callback for task %d returned %d (attempt %d/%d)",
+                "Callback for task %d returned %d (attempt %d/%d) — retrying",
                 task_id,
                 response.status_code,
                 attempt,
-                MAX_RETRIES,
+                MAX_ATTEMPTS,
             )
         except requests.RequestException as exc:
+            last_error = str(exc)
             logger.warning(
-                "Callback for task %d failed with %s (attempt %d/%d)",
+                "Callback for task %d failed with %s (attempt %d/%d) — retrying",
                 task_id,
                 exc,
                 attempt,
-                MAX_RETRIES,
+                MAX_ATTEMPTS,
             )
 
-        if attempt < MAX_RETRIES:
-            time.sleep(RETRY_DELAY_SECONDS)
-
     logger.error(
-        "All %d callback attempts failed for task %d. "
+        "All %d callback attempts failed for task %d (last error: %s). "
         "callback_url=%s, status=%s",
-        MAX_RETRIES,
+        MAX_ATTEMPTS,
         task_id,
+        last_error,
         callback_url,
         status,
     )

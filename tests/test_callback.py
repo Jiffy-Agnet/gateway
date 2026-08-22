@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 from django.test import TestCase
 
 from apps.ingestion.callback import format_callback_body, send_fallback_callback, send_callback
+from jobs.callback_retry import BASE_DELAY_SECONDS, TIMEOUT_SECONDS
 from jobs.models import Task
 
 
@@ -459,3 +460,86 @@ class TestFormatQuestionBody(TestCase):
         body = json.loads(mock_request.call_args.kwargs["data"].decode("utf-8"))
         self.assertIn("Postgres or SQLite?", body["body"])
         self.assertIn("❓", body["body"])
+
+
+class TestGatewayRetryPolicy(TestCase):
+    """The Gateway fallback retries on the same terms as the sandbox wrapper."""
+
+    def setUp(self):
+        self.task = Task.objects.create(
+            provider="github",
+            repo_url="https://github.com/user/repo",
+            issue_external_id="1",
+            callback_url="https://example.com/cb",
+            callback_secret="sec",
+            status="done",
+        )
+
+    @patch("apps.ingestion.callback.time.sleep")
+    @patch("apps.ingestion.callback.requests.request")
+    def test_client_errors_are_not_retried(self, mock_request, mock_sleep):
+        """A rejected secret or a deleted issue answers the same way every time."""
+        for code in (400, 401, 403, 404, 422):
+            mock_request.reset_mock()
+            mock_sleep.reset_mock()
+            mock_request.return_value = MagicMock(status_code=code)
+
+            send_fallback_callback(self.task, status="done", summary="ok")
+
+            self.assertEqual(mock_request.call_count, 1, code)
+            mock_sleep.assert_not_called()
+
+    @patch("apps.ingestion.callback.time.sleep")
+    @patch("apps.ingestion.callback.requests.request")
+    def test_busy_client_statuses_are_retried(self, mock_request, mock_sleep):
+        for code in (408, 429):
+            mock_request.reset_mock()
+            mock_request.side_effect = [
+                MagicMock(status_code=code),
+                MagicMock(status_code=201),
+            ]
+            send_fallback_callback(self.task, status="done", summary="ok")
+            self.assertEqual(mock_request.call_count, 2, code)
+
+    @patch("apps.ingestion.callback.time.sleep")
+    @patch("apps.ingestion.callback.requests.request")
+    def test_backoff_is_exponential(self, mock_request, mock_sleep):
+        mock_request.return_value = MagicMock(status_code=500)
+
+        send_fallback_callback(self.task, status="done", summary="ok")
+
+        self.assertEqual(
+            [call.args[0] for call in mock_sleep.call_args_list],
+            [BASE_DELAY_SECONDS, BASE_DELAY_SECONDS * 2],
+        )
+
+    @patch("apps.ingestion.callback.time.sleep")
+    @patch("apps.ingestion.callback.requests.request")
+    def test_every_attempt_and_the_outcome_are_logged(self, mock_request, mock_sleep):
+        mock_request.return_value = MagicMock(status_code=500)
+
+        with self.assertLogs("apps.ingestion.callback", level="INFO") as cm:
+            send_fallback_callback(self.task, status="done", summary="ok")
+
+        messages = "\n".join(cm.output)
+        self.assertIn("attempt 1/3", messages)
+        self.assertIn("attempt 2/3", messages)
+        self.assertIn("attempt 3/3", messages)
+        self.assertIn("All 3 callback attempts failed", messages)
+
+    @patch("apps.ingestion.callback.time.sleep")
+    @patch("apps.ingestion.callback.requests.request")
+    def test_a_permanent_rejection_is_logged_as_such(self, mock_request, mock_sleep):
+        mock_request.return_value = MagicMock(status_code=404)
+
+        with self.assertLogs("apps.ingestion.callback", level="ERROR") as cm:
+            send_fallback_callback(self.task, status="done", summary="ok")
+
+        self.assertIn("not retrying", "\n".join(cm.output))
+
+    @patch("apps.ingestion.callback.time.sleep")
+    @patch("apps.ingestion.callback.requests.request")
+    def test_request_timeout_is_bounded(self, mock_request, mock_sleep):
+        mock_request.return_value = MagicMock(status_code=201)
+        send_fallback_callback(self.task, status="done", summary="ok")
+        self.assertEqual(mock_request.call_args.kwargs["timeout"], TIMEOUT_SECONDS)

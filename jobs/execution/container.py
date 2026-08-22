@@ -835,6 +835,16 @@ def _wait_for_exec(
 # Where the full instructions text is staged inside the container.
 INSTRUCTIONS_PATH = "/tmp/jiffy_instructions.txt"
 
+# The deterministic callback sender staged alongside it, and the config that
+# tells it where to post and how hard to retry.  The script is staged per run
+# rather than baked into the image so it stays in lockstep with the Gateway
+# without needing an image rebuild.
+CALLBACK_SCRIPT_PATH = "/tmp/jiffy_callback.py"
+CALLBACK_CONFIG_PATH = "/tmp/jiffy_callback.json"
+SANDBOX_CALLBACK_SCRIPT_SOURCE = (
+    Path(__file__).resolve().parent / "sandbox_scripts" / "jiffy_callback.py"
+)
+
 # The Linux kernel caps a *single* argv entry at MAX_ARG_STRLEN (32 pages =
 # 128 KiB); anything longer makes execve fail with E2BIG. An issue thread is
 # the whole conversation — issue body plus every comment — so a busy thread
@@ -844,35 +854,77 @@ INSTRUCTIONS_PATH = "/tmp/jiffy_instructions.txt"
 MAX_INLINE_INSTRUCTIONS_BYTES = 96 * 1024
 
 
-def write_instructions_file(container: Container, instructions: str) -> None:
-    """Stage the instructions text at ``INSTRUCTIONS_PATH`` inside *container*.
+def stage_file_in_container(
+    container: Container,
+    path: str,
+    content: str,
+    mode: int = 0o644,
+) -> None:
+    """Write *content* to *path* inside *container*.
 
-    Written as a tar stream through the Docker API rather than echoed through
-    a shell command: a shell command carrying the text inline is itself an
+    Sent as a tar stream through the Docker API rather than echoed through a
+    shell command: a shell command carrying the content inline is itself an
     argv entry, so it would fail with "Argument list too long" on exactly the
-    large issue threads this needs to support. A tar upload has no such limit.
+    large issue threads this needs to support. A tar upload has no such limit,
+    and nothing has to be shell-escaped on the way in.
     """
-    payload = instructions.encode("utf-8")
-    directory, _, filename = INSTRUCTIONS_PATH.rpartition("/")
+    payload = content.encode("utf-8")
+    directory, _, filename = path.rpartition("/")
 
     archive = io.BytesIO()
     with tarfile.open(fileobj=archive, mode="w") as tar:
         info = tarfile.TarInfo(name=filename)
         info.size = len(payload)
-        info.mode = 0o644
+        info.mode = mode
         info.mtime = int(time.time())
         tar.addfile(info, io.BytesIO(payload))
     archive.seek(0)
 
     try:
         if not container.put_archive(directory or "/", archive.getvalue()):
-            raise ContainerError(
-                f"Docker rejected the instructions upload to {INSTRUCTIONS_PATH}"
-            )
+            raise ContainerError(f"Docker rejected the upload to {path}")
     except ContainerError:
         raise
     except Exception as exc:
-        raise ContainerError(f"Failed to write instructions file: {exc}") from exc
+        raise ContainerError(f"Failed to write {path}: {exc}") from exc
+
+
+def write_instructions_file(container: Container, instructions: str) -> None:
+    """Stage the instructions text at ``INSTRUCTIONS_PATH`` inside *container*."""
+    stage_file_in_container(container, INSTRUCTIONS_PATH, instructions)
+
+
+def stage_callback_wrapper(
+    container: Container,
+    callback_config: Dict[str, Any],
+    task_id: int = 0,
+) -> None:
+    """Stage the deterministic callback sender and its config in *container*.
+
+    The sandbox's one outbound HTTP call is delivered by this script, not by
+    the agent hand-rolling a request: retries, the transient/permanent split,
+    and the reported outcome are all fixed code rather than model judgment.
+    """
+    try:
+        script = SANDBOX_CALLBACK_SCRIPT_SOURCE.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ContainerError(
+            f"Callback wrapper source is missing or unreadable at "
+            f"{SANDBOX_CALLBACK_SCRIPT_SOURCE}: {exc}"
+        ) from exc
+    stage_file_in_container(container, CALLBACK_SCRIPT_PATH, script, mode=0o755)
+    stage_file_in_container(
+        container,
+        CALLBACK_CONFIG_PATH,
+        json.dumps(callback_config, ensure_ascii=False, indent=2),
+    )
+    logger.info(
+        "[%d] Staged the callback wrapper at %s (%s attempts, %ss base backoff)",
+        task_id,
+        CALLBACK_SCRIPT_PATH,
+        callback_config.get("max_attempts", "?"),
+        callback_config.get("base_delay_seconds", "?"),
+    )
 
 
 def build_agent_command(instructions_bytes: int, task_id: int = 0) -> str:
@@ -911,6 +963,7 @@ def run_agent_in_container(
         instructions: str,
         task_id: int = 0,
         timeout_seconds: int | None = None,
+        callback_config: Dict[str, Any] | None = None,
 ) -> None:
     """Run the coding agent inside the container with the given instructions."""
     effective_timeout = timeout_seconds or getattr(
@@ -921,6 +974,8 @@ def run_agent_in_container(
                 effective_timeout, model)
 
     write_instructions_file(container, instructions)
+    if callback_config:
+        stage_callback_wrapper(container, callback_config, task_id=task_id)
 
     # Use login shell (-l) so .profile is sourced and all tools (nvm, uv, etc.) are available
     # Redirect agent stdout/stderr to the container's main stdout so docker logs

@@ -9,6 +9,7 @@ from django.conf import settings
 from django.db import connections
 
 from apps.ingestion.callback import send_fallback_callback
+from jobs.callback_specs import build_sandbox_callback_config, get_callback_spec
 from jobs.execution.agent import (
     AgentResult,
     build_agent_instructions,
@@ -359,6 +360,23 @@ def execute_task(self, task_id: int) -> None:
             # Running — agent does everything from here
             _update_status(task, "running")
             instructions = build_agent_instructions(payload)
+            try:
+                callback_config = build_sandbox_callback_config(
+                    get_callback_spec(task.provider),
+                    callback_url=callback["url"],
+                    callback_secret=callback.get("secret", ""),
+                )
+            except KeyError:
+                # Unknown provider: the run still goes ahead, and the Gateway
+                # fallback remains the safety net for reporting.
+                callback_config = None
+                _task_log(
+                    task_id,
+                    logging.WARNING,
+                    "No callback spec for this provider — the sandbox will run "
+                    "without the callback wrapper",
+                    provider=task.provider,
+                )
             # Size is logged so a prompt that arrives at the agent truncated is
             # visible in one line rather than inferred from the agent asking
             # what the task was.
@@ -369,7 +387,12 @@ def execute_task(self, task_id: int) -> None:
                 len(instructions.encode("utf-8")),
                 provider=task.provider,
             )
-            run_agent_in_container(container, instructions, task_id=task_id)
+            run_agent_in_container(
+                container,
+                instructions,
+                task_id=task_id,
+                callback_config=callback_config,
+            )
 
             # Read result
             result = read_agent_result(container)
