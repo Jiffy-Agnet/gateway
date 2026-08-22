@@ -8,6 +8,7 @@ class Task(models.Model):
         ("cloning", "Cloning"),
         ("running", "Running"),
         ("reporting", "Reporting"),
+        ("needs_input", "Waiting for user input"),
         ("done", "Done"),
         ("failed", "Failed"),
     ]
@@ -23,6 +24,8 @@ class Task(models.Model):
     callback_secret = models.CharField(max_length=1024)
     pr_url = models.URLField(null=True, blank=True)  # populated from the agent's final result, if it opened one
     error_message = models.TextField(null=True, blank=True)
+    question = models.TextField(null=True, blank=True)  # the agent's clarifying question, when it could not
+                                                        # proceed without an answer; posted back to the issue
     celery_task_id = models.CharField(max_length=64, null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

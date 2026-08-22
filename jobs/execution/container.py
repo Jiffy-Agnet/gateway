@@ -1,7 +1,9 @@
 """Manages the lifecycle of a Docker container for a task."""
+import io
 import json
 import logging
 import os
+import tarfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -826,6 +828,84 @@ def _wait_for_exec(
         time.sleep(min(AGENT_POLL_INTERVAL_SECONDS, remaining))
 
 
+# ---------------------------------------------------------------------------
+# Agent instructions staging
+# ---------------------------------------------------------------------------
+
+# Where the full instructions text is staged inside the container.
+INSTRUCTIONS_PATH = "/tmp/jiffy_instructions.txt"
+
+# The Linux kernel caps a *single* argv entry at MAX_ARG_STRLEN (32 pages =
+# 128 KiB); anything longer makes execve fail with E2BIG. An issue thread is
+# the whole conversation — issue body plus every comment — so a busy thread
+# can blow past that on its own. Instructions up to this size are passed to
+# the agent inline as before; beyond it they are handed over by path (see
+# ``build_agent_command``) so no thread is ever too large to run.
+MAX_INLINE_INSTRUCTIONS_BYTES = 96 * 1024
+
+
+def write_instructions_file(container: Container, instructions: str) -> None:
+    """Stage the instructions text at ``INSTRUCTIONS_PATH`` inside *container*.
+
+    Written as a tar stream through the Docker API rather than echoed through
+    a shell command: a shell command carrying the text inline is itself an
+    argv entry, so it would fail with "Argument list too long" on exactly the
+    large issue threads this needs to support. A tar upload has no such limit.
+    """
+    payload = instructions.encode("utf-8")
+    directory, _, filename = INSTRUCTIONS_PATH.rpartition("/")
+
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as tar:
+        info = tarfile.TarInfo(name=filename)
+        info.size = len(payload)
+        info.mode = 0o644
+        info.mtime = int(time.time())
+        tar.addfile(info, io.BytesIO(payload))
+    archive.seek(0)
+
+    try:
+        if not container.put_archive(directory or "/", archive.getvalue()):
+            raise ContainerError(
+                f"Docker rejected the instructions upload to {INSTRUCTIONS_PATH}"
+            )
+    except ContainerError:
+        raise
+    except Exception as exc:
+        raise ContainerError(f"Failed to write instructions file: {exc}") from exc
+
+
+def build_agent_command(instructions_bytes: int, task_id: int = 0) -> str:
+    """Build the shell command that runs the agent over the staged instructions.
+
+    Small instructions are substituted into the agent's argv, which is what
+    ``opencode run`` expects. Oversized ones would hit the kernel's
+    per-argument limit, so the agent is instead pointed at the staged file and
+    told to read it first — the full text still reaches the agent, just
+    through the filesystem instead of argv.
+    """
+    if instructions_bytes <= MAX_INLINE_INSTRUCTIONS_BYTES:
+        prompt = f'"$(cat {INSTRUCTIONS_PATH})"'
+    else:
+        logger.info(
+            "[%d] Instructions are %d bytes — handing them to the agent by "
+            "path instead of inline to stay under the argv limit",
+            task_id,
+            instructions_bytes,
+        )
+        prompt = (
+            f'"Your full task instructions are too large to pass inline and '
+            f'have been written to {INSTRUCTIONS_PATH}. Read that entire file '
+            f'first — it is the complete, verbatim task, including the required '
+            f'output contract — then carry it out exactly as written."'
+        )
+
+    return (
+        f"cd {WORKSPACE} && "
+        f"opencode run --auto {prompt} > /proc/1/fd/1 2>&1"
+    )
+
+
 def run_agent_in_container(
         container: Container,
         instructions: str,
@@ -840,26 +920,12 @@ def run_agent_in_container(
     logger.info("[%d] Running agent in container %s (timeout=%ds, model=%s)", task_id, container.short_id,
                 effective_timeout, model)
 
-    escaped_instructions = instructions.replace("\\", "\\\\").replace("'", "'\\''")
-    write_cmd = f"printf '%s' '{escaped_instructions}' > /tmp/jiffy_instructions.txt"
-    exit_code, (output, err) = container.exec_run(
-        cmd=["bash", "-c", write_cmd],
-        demux=True,
-    )
-    if exit_code != 0:
-        raise ContainerError(
-            f"Failed to write instructions file: {(err or b'').decode(errors='replace')}"
-        )
+    write_instructions_file(container, instructions)
 
-    # Read instructions from file and pass to opencode
     # Use login shell (-l) so .profile is sourced and all tools (nvm, uv, etc.) are available
     # Redirect agent stdout/stderr to the container's main stdout so docker logs
-    # shows real-time output; exit code remains captured via exec_run return value.
-    run_cmd = (
-        'cd /workspace && '
-        'INSTRUCTIONS=$(cat /tmp/jiffy_instructions.txt) && '
-        'opencode run --auto "$INSTRUCTIONS" > /proc/1/fd/1 2>&1'
-    )
+    # shows real-time output; exit code remains captured via exec_inspect.
+    run_cmd = build_agent_command(len(instructions.encode("utf-8")), task_id=task_id)
 
     # Start the agent *detached* and poll for completion instead of blocking on
     # the exec's output stream.

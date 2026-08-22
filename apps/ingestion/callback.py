@@ -25,6 +25,12 @@ MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 2
 
 
+QUESTION_REPLY_HINT = (
+    "Reply on this issue to answer — your reply starts a new Jiffy task with "
+    "the full thread."
+)
+
+
 def format_callback_body(
     task_id: int,
     status: str,
@@ -33,21 +39,41 @@ def format_callback_body(
     branch_name: str | None = None,
     pr_url: str | None = None,
     error_message: str | None = None,
+    question: str | None = None,
 ) -> str:
     """Format the callback payload as human-readable text.
 
     Args:
         task_id: The task ID.
-        status: The final status ("done" or "failed").
+        status: The final status ("done", "failed", or "question").
         summary: Optional summary of the result.
         technical_report: Optional detailed technical report in markdown.
         branch_name: Optional branch name.
         pr_url: Optional PR/MR URL if one was opened.
         error_message: Optional error message if the task failed.
+        question: The agent's question, when *status* is "question".
 
     Returns:
         Human-readable text suitable for posting as an issue/PR comment.
     """
+    if status == "question":
+        # The agent stopped to ask rather than guess. The question is posted
+        # back as a comment on the originating issue; the answer arrives as a
+        # reply, which the edge picks up as a brand-new task.
+        lines = [
+            f"Task #{task_id}: ❓ Jiffy has a question before continuing.",
+            "",
+            f"**Question:** {question or 'No question text was provided.'}",
+        ]
+        if branch_name:
+            lines.append("")
+            lines.append(f"**Branch:** {branch_name}")
+        if summary:
+            lines.append("")
+            lines.append(f"**Progress so far:** {summary}")
+        lines.extend(["", "---", "", QUESTION_REPLY_HINT])
+        return "\n".join(lines)
+
     if status == "failed":
         lines = [
             f"Task #{task_id}: ❌ Jiffy could not complete this task.",
@@ -131,6 +157,7 @@ def send_fallback_callback(
     branch_name: str | None = None,
     pr_url: str | None = None,
     error_message: str | None = None,
+    question: str | None = None,
 ) -> None:
     """Gateway fallback callback using the provider's spec.
 
@@ -158,6 +185,7 @@ def send_fallback_callback(
         branch_name=branch_name,
         pr_url=pr_url,
         error_message=error_message,
+        question=question,
     )
 
 
@@ -172,6 +200,7 @@ def _send_callback_via_spec(
     branch_name: str | None = None,
     pr_url: str | None = None,
     error_message: str | None = None,
+    question: str | None = None,
 ) -> None:
     """Low-level callback delivery using a declarative spec.
 
@@ -189,6 +218,7 @@ def _send_callback_via_spec(
         branch_name=branch_name,
         pr_url=pr_url,
         error_message=error_message,
+        question=question,
     )
 
     headers = build_callback_headers(spec, callback_secret)

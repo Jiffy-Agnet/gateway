@@ -1,5 +1,6 @@
 """Tests for callback dispatch."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 from django.test import TestCase
@@ -403,3 +404,58 @@ class TestSendFallbackCallback(TestCase):
         body = mock_request.call_args[1]["data"].decode("utf-8")
         self.assertIn("### Technical Report", body)
         self.assertIn("Task completed.", body)
+
+
+class TestFormatQuestionBody(TestCase):
+    """A question from the agent is posted back as a reply on the issue."""
+
+    def test_question_body_carries_the_question(self):
+        body = format_callback_body(
+            task_id=7,
+            status="question",
+            question="Should the retry use exponential or fixed backoff?",
+        )
+        self.assertIn("Task #7: ❓ Jiffy has a question before continuing.", body)
+        self.assertIn(
+            "**Question:** Should the retry use exponential or fixed backoff?", body
+        )
+        self.assertIn("Reply on this issue to answer", body)
+
+    def test_question_body_includes_partial_work(self):
+        body = format_callback_body(
+            task_id=7,
+            status="question",
+            question="Which database?",
+            branch_name="Jiffy/add-cache",
+            summary="Scaffolding is pushed; the storage choice is open.",
+        )
+        self.assertIn("**Branch:** Jiffy/add-cache", body)
+        self.assertIn("**Progress so far:** Scaffolding is pushed", body)
+
+    def test_question_body_omits_branch_when_absent(self):
+        body = format_callback_body(task_id=7, status="question", question="Which one?")
+        self.assertNotIn("**Branch:**", body)
+
+    def test_question_body_is_not_a_failure_report(self):
+        body = format_callback_body(task_id=7, status="question", question="Which one?")
+        self.assertNotIn("❌", body)
+        self.assertNotIn("could not complete", body)
+
+    def test_question_reaches_the_wire_through_the_fallback(self):
+        task = Task.objects.create(
+            provider="github",
+            repo_url="https://github.com/user/repo",
+            issue_external_id="1",
+            callback_url="https://example.com/cb",
+            callback_secret="sec",
+            status="needs_input",
+        )
+        with patch("apps.ingestion.callback.requests.request") as mock_request:
+            mock_request.return_value = MagicMock(status_code=201)
+            send_fallback_callback(
+                task, status="question", question="Postgres or SQLite?"
+            )
+
+        body = json.loads(mock_request.call_args.kwargs["data"].decode("utf-8"))
+        self.assertIn("Postgres or SQLite?", body["body"])
+        self.assertIn("❓", body["body"])

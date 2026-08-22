@@ -1,10 +1,17 @@
 """Tests for how the agent process is executed inside the sandbox container."""
 
+import io
+import tarfile
 from unittest.mock import MagicMock, patch
 
 from django.test import TestCase, override_settings
 
-from jobs.execution.container import run_agent_in_container
+from jobs.execution.container import (
+    MAX_INLINE_INSTRUCTIONS_BYTES,
+    build_agent_command,
+    run_agent_in_container,
+    write_instructions_file,
+)
 from jobs.execution.exceptions import ContainerError
 
 
@@ -70,3 +77,77 @@ class RunAgentInContainerTest(TestCase):
             with self.assertRaises(ContainerError) as ctx:
                 run_agent_in_container(container, "do the thing", task_id=1)
         self.assertIn("did not finish within 120s", str(ctx.exception))
+
+
+class InstructionsStagingTest(TestCase):
+    """The instructions text must not be capped by any shell/argv limit.
+
+    An issue thread is the whole conversation — issue body plus every comment —
+    so it can be far larger than the kernel's per-argument ceiling
+    (MAX_ARG_STRLEN, 128 KiB).  Staging it through a shell command, as the
+    Gateway used to, made a large thread fail with "Argument list too long".
+    """
+
+    def test_instructions_are_uploaded_not_echoed_through_a_shell(self):
+        container = MagicMock()
+        text = "x" * (4 * 1024 * 1024)
+
+        write_instructions_file(container, text)
+
+        container.put_archive.assert_called_once()
+        path, archive = container.put_archive.call_args.args
+        self.assertEqual(path, "/tmp")
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+            member = tar.getmember("jiffy_instructions.txt")
+            self.assertEqual(
+                tar.extractfile(member).read().decode("utf-8"), text
+            )
+        # Nothing may go through a shell: that is what imposed the old limit.
+        container.exec_run.assert_not_called()
+
+    def test_shell_metacharacters_survive_verbatim(self):
+        container = MagicMock()
+        text = "quotes ' \" and $(rm -rf /) and \\backslash\\ and\nnewlines"
+
+        write_instructions_file(container, text)
+
+        _, archive = container.put_archive.call_args.args
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+            body = tar.extractfile(tar.getmember("jiffy_instructions.txt")).read()
+        self.assertEqual(body.decode("utf-8"), text)
+
+    def test_upload_rejection_raises_container_error(self):
+        container = MagicMock()
+        container.put_archive.return_value = False
+        with self.assertRaises(ContainerError):
+            write_instructions_file(container, "hello")
+
+    def test_small_instructions_are_passed_inline(self):
+        cmd = build_agent_command(1024)
+        self.assertIn('opencode run --auto "$(cat /tmp/jiffy_instructions.txt)"', cmd)
+
+    def test_oversized_instructions_are_passed_by_path(self):
+        cmd = build_agent_command(MAX_INLINE_INSTRUCTIONS_BYTES + 1)
+        self.assertNotIn("$(cat", cmd)
+        self.assertIn("/tmp/jiffy_instructions.txt", cmd)
+        # The prompt argv must stay well under the kernel's per-argument cap.
+        self.assertLess(len(cmd.encode("utf-8")), 4096)
+
+    def test_a_multi_megabyte_thread_still_runs(self):
+        """End-to-end: a huge thread reaches the agent instead of blowing up."""
+        container = MagicMock()
+        container.short_id = "abc123"
+        container.exec_run.return_value = (0, (b'{"model": "test/model"}', b""))
+        api = container.client.api
+        api.exec_create.return_value = {"Id": "exec-1"}
+        api.exec_inspect.side_effect = [{"Running": False, "ExitCode": 0}]
+
+        instructions = "y" * (2 * 1024 * 1024)
+        run_agent_in_container(container, instructions, task_id=7)
+
+        _, archive = container.put_archive.call_args.args
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+            staged = tar.extractfile(tar.getmember("jiffy_instructions.txt")).read()
+        self.assertEqual(len(staged), len(instructions.encode("utf-8")))
+        run_cmd = api.exec_create.call_args.kwargs["cmd"][3]
+        self.assertLess(len(run_cmd.encode("utf-8")), 4096)

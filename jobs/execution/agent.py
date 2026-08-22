@@ -12,6 +12,11 @@ logger = logging.getLogger(__name__)
 
 AGENT_RESULT_PATH = "/workspace/.jiffy_result.json"
 
+# Statuses the agent may report in its result file. "question" means the run
+# ended because the agent needs an answer from the requester before it can
+# continue — it is neither a success nor a failure.
+VALID_AGENT_STATUSES = ("done", "failed", "question")
+
 
 class AgentResult(NamedTuple):
     status: str
@@ -23,6 +28,9 @@ class AgentResult(NamedTuple):
     error_message: str | None
     model: str | None
     callback: dict | None
+    # Trails the required fields so it can default: only a "question" status
+    # carries one.
+    question: str | None = None
 
 
 def _format_turns(turns: list[dict]) -> str:
@@ -177,6 +185,36 @@ You own the entire rest of the workflow. Specifically:
    or partially succeeded), you MUST attempt to call the callback endpoint to
    report your result. See "Callback Delivery" below for details.
 
+## Asking a Question
+
+Nobody is watching your terminal, and there is no interactive prompt: anything
+you ask that is not delivered through the callback is lost. So if at any point
+you have a question — the request is ambiguous, it contradicts the codebase, it
+needs a credential or a decision you cannot make, or you would otherwise have to
+guess at something that changes what you build — you must ask it by reporting a
+`question` result. Never guess silently, and never end a run leaving a question
+only in your logs or your summary.
+
+Ask only about what actually blocks you, and ask it in full: state what you
+already tried and understood, then the specific thing you need decided. Prefer
+concrete options ("A or B?") over open questions where you can. Group everything
+you need into one message — you get one reply, and it arrives as a brand-new
+task, not as a continuation of this run.
+
+To ask:
+
+- Set `status` to `"question"` in your result file and put the question text in
+  the `question` field.
+- Deliver it through the callback using the question format below, so it is
+  posted as a reply on the issue thread the request came from.
+- Commit and push whatever partial, coherent work you already have (if any) so
+  it is not lost, and report the branch. Do not open a PR for incomplete work
+  unless the issue text asked for one.
+
+The requester answers by replying on the issue, which starts a new task with the
+full thread — including your question and their answer — so write the question
+to be understandable on its own.
+
 ## Callback Delivery
 
 You MUST attempt exactly ONE call to the callback endpoint after finishing
@@ -211,10 +249,26 @@ Task #<task_id>: ❌ Jiffy could not complete this task.
 **Reason:** <error_message>
 ```
 
+For a task that is blocked on a question (see "Asking a Question" above):
+
+```
+Task #<task_id>: ❓ Jiffy has a question before continuing.
+
+**Question:** <question>
+
+**Branch:** <branch_name>
+
+---
+
+Reply on this issue to answer — your reply starts a new Jiffy task with the
+full thread.
+```
+
 Rules:
 - If `pr_url` is null/empty, omit the **Pull Request:** line entirely.
 - If `branch_name` is null/empty, omit the **Branch:** line entirely.
 - If `technical_report` is missing or empty, omit the entire `Technical Report` section (including the `---` separator and heading) entirely.
+- In the question format, omit the **Branch:** line if you have no branch to report; keep the closing "Reply on this issue" note always.
 - The `technical_report` field, when present, must use the following structure:
 
   ## What was done
@@ -249,8 +303,8 @@ Callback endpoint details:
 
 ## Required Final Output
 
-When you are finished — whether you succeeded or failed — you MUST produce a
-JSON file at the following path:
+When you are finished — whether you succeeded, failed, or stopped to ask a
+question — you MUST produce a JSON file at the following path:
 
     {AGENT_RESULT_PATH}
 
@@ -258,7 +312,7 @@ The file must contain exactly one JSON object with these fields:
 
 | Field                  | Type     | Required | Description |
 |------------------------|----------|----------|-------------|
-| `status`               | string   | yes      | `"done"` if the task was completed, `"failed"` if it was not. |
+| `status`               | string   | yes      | `"done"` if the task was completed, `"failed"` if it was not, `"question"` if you stopped to ask the requester something. |
 | `branch_name`          | string   | yes      | The branch you created or worked on. |
 | `branch_base`          | string   | yes      | The branch you created new branch from. |
 | `pr_url`               | string   | no       | URL of the PR/MR you opened, if any. |
@@ -266,6 +320,7 @@ The file must contain exactly one JSON object with these fields:
 | `summary`              | string   | yes      | A brief summary of what you did. |
 | `technical_report`     | string   | no       | Detailed technical report in markdown format for developer/technical reviewer. Must use the structure described in the Callback Delivery section above. |
 | `error_message`        | string   | no       | Details of what went wrong, if `status` is `"failed"`. |
+| `question`             | string   | yes if `status` is `"question"` | The question you need answered before you can continue. Required — a `"question"` status without it is treated as a failure. |
 | `callback`             | object   | yes      | Outcome of your callback attempt. See below. |
 
 ### The `callback` object
@@ -314,6 +369,7 @@ def read_agent_result(container: Container) -> AgentResult:
         summary: str | None = None,
         technical_report: str | None = None,
         error_message: str | None = None,
+        question: str | None = None,
         model: str | None = None,
         callback: dict | None = None,
     ) -> AgentResult:
@@ -325,6 +381,7 @@ def read_agent_result(container: Container) -> AgentResult:
             summary=summary,
             technical_report=technical_report,
             error_message=error_message,
+            question=question,
             model=model,
             callback=callback or {"attempted": False, "succeeded": False, "error": "No callback information available"},
         )
@@ -346,7 +403,19 @@ def read_agent_result(container: Container) -> AgentResult:
         result_data = json.loads(output)
         callback = _parse_callback(result_data)
         status = result_data.get("status")
-        if status not in ("done", "failed"):
+        question = result_data.get("question")
+        if not isinstance(question, str) or not question.strip():
+            question = None
+        # A "question" status means the agent stopped to ask for clarification
+        # rather than guessing; without a question to relay it is just a
+        # failure, so it is downgraded to one below.
+        if status == "question" and question is None:
+            status = "failed"
+            result_data.setdefault(
+                "error_message",
+                "Agent reported status 'question' without a 'question' field.",
+            )
+        if status not in VALID_AGENT_STATUSES:
             return _make_result(
                 status="failed",
                 branch_name=result_data.get("branch_name"),
@@ -356,8 +425,10 @@ def read_agent_result(container: Container) -> AgentResult:
                 technical_report=result_data.get("technical_report"),
                 error_message=(
                     result_data.get("error_message")
-                    or "Agent result JSON is missing a valid 'status' field (must be 'done' or 'failed')."
+                    or "Agent result JSON is missing a valid 'status' field "
+                    f"(must be one of: {', '.join(sorted(VALID_AGENT_STATUSES))})."
                 ),
+                question=question,
                 model=result_data.get("model"),
                 callback=callback,
             )
@@ -369,6 +440,7 @@ def read_agent_result(container: Container) -> AgentResult:
             summary=result_data.get("summary"),
             technical_report=result_data.get("technical_report"),
             error_message=result_data.get("error_message"),
+            question=question,
             model=result_data.get("model"),
             callback=callback,
         )

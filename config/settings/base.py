@@ -334,6 +334,24 @@ LOGGING = {
 }
 
 
+# --- Ingestion request body size ------------------------------------------
+# An issue thread handed to Jiffy is the *entire* conversation — issue body
+# plus every comment — so a busy thread can be megabytes of text.  Django's
+# default ``DATA_UPLOAD_MAX_MEMORY_SIZE`` (2.5 MiB) would reject those with a
+# ``RequestDataTooBig`` before the ingestion view ever sees them, silently
+# capping how much of an issue can reach the agent.  Uncapped by default;
+# set ``MAX_INGEST_BODY_BYTES`` to a positive byte count to re-impose a limit.
+try:
+    _max_ingest_body = int(os.environ.get("MAX_INGEST_BODY_BYTES", "0"))
+except ValueError:
+    _max_ingest_body = 0
+DATA_UPLOAD_MAX_MEMORY_SIZE = _max_ingest_body if _max_ingest_body > 0 else None
+
+# JSON payloads are read as a single body, not as form fields, so the field
+# count cap only ever gets in the way here.
+DATA_UPLOAD_MAX_NUMBER_FIELDS = None
+
+
 # Django REST Framework
 REST_FRAMEWORK = {
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',

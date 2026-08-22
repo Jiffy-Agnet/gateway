@@ -1354,3 +1354,154 @@ class NetworkRestrictionTest(TestCase):
         messages = [r.getMessage() for r in cm.records]
         disabled = [m for m in messages if "Network restriction DISABLED" in m]
         self.assertTrue(disabled, "Expected a DISABLED restriction log line")
+
+
+class AgentQuestionTest(TestCase):
+    """An agent that has a question must get it back onto the issue thread.
+
+    Nothing about the run is interactive, so a question the agent cannot post
+    is a question nobody ever sees.  A ``"question"`` result parks the task on
+    ``needs_input`` and relays the text as a reply — the answer arrives later
+    as a brand-new task.
+    """
+
+    def _create_task(self, **kwargs):
+        defaults = {
+            "provider": "github",
+            "repo_url": "https://github.com/user/repo",
+            "issue_external_id": "100",
+            "callback_url": "https://example.com/cb",
+            "callback_secret": "sec",
+            "status": "queued",
+        }
+        defaults.update(kwargs)
+        return Task.objects.create(**defaults)
+
+    def _container_with_result(self, result: dict):
+        container = MagicMock()
+        container.short_id = "abc123"
+        container.exec_run.return_value = (
+            0,
+            (json.dumps(result).encode(), b""),
+        )
+        return container
+
+    def test_question_result_is_parsed(self):
+        container = self._container_with_result({
+            "status": "question",
+            "branch_name": "Jiffy/add-cache",
+            "summary": "Scaffolding pushed.",
+            "question": "Redis or in-process cache?",
+            "callback": {"attempted": True, "succeeded": True, "error": None},
+        })
+        result = read_agent_result(container)
+        self.assertEqual(result.status, "question")
+        self.assertEqual(result.question, "Redis or in-process cache?")
+
+    def test_question_status_without_a_question_is_a_failure(self):
+        """A "question" nobody can read is worse than an honest failure."""
+        container = self._container_with_result({
+            "status": "question",
+            "question": "   ",
+            "callback": {"attempted": True, "succeeded": True, "error": None},
+        })
+        result = read_agent_result(container)
+        self.assertEqual(result.status, "failed")
+        self.assertIsNone(result.question)
+        self.assertIn("question", result.error_message)
+
+    def test_instructions_tell_the_agent_how_to_ask(self):
+        instructions = build_agent_instructions({
+            "repo": {"url": "https://github.com/user/repo"},
+            "issue": {"text": "Do the thing", "external_issue_id": "1"},
+            "callback": {"url": "https://example.com/cb", "secret": "sec"},
+        })
+        self.assertIn("## Asking a Question", instructions)
+        self.assertIn('`"question"`', instructions)
+        self.assertIn("Never guess silently", instructions)
+        self.assertIn("❓ Jiffy has a question before continuing.", instructions)
+
+    @patch("jobs.tasks.send_fallback_callback")
+    @patch("jobs.tasks.ensure_sandbox_image")
+    @patch("jobs.tasks.read_agent_result")
+    @patch("jobs.tasks.run_agent_in_container")
+    @patch("jobs.tasks.clone_repo_in_container")
+    @patch("jobs.tasks.start_generic_sandbox_container")
+    @patch("jobs.tasks.load_payload_from_redis")
+    def test_question_parks_the_task_and_falls_back_to_the_gateway(
+        self, mock_load, mock_container, mock_clone, mock_run, mock_result, mock_ensure, mock_cb
+    ):
+        task = self._create_task()
+        mock_load.return_value = {
+            "repo": {"url": "https://github.com/user/repo", "token": "ghp_test"},
+            "issue": {"text": "Do the thing", "external_issue_id": "100"},
+            "callback": {"url": "https://example.com/cb", "secret": "sec"},
+        }
+        mock_container.return_value.__enter__ = MagicMock(return_value=MagicMock())
+        mock_container.return_value.__exit__ = MagicMock(return_value=False)
+        mock_result.return_value = AgentResult(
+            status="question",
+            branch_name="Jiffy/add-cache",
+            pr_url=None,
+            programming_language="python",
+            summary="Scaffolding pushed.",
+            technical_report=None,
+            error_message=None,
+            model="test/model",
+            callback={"attempted": False, "succeeded": False, "error": "no network"},
+            question="Redis or in-process cache?",
+        )
+
+        from jobs.tasks import execute_task
+
+        execute_task(task.id)
+
+        task.refresh_from_db()
+        self.assertEqual(task.status, "needs_input")
+        self.assertEqual(task.question, "Redis or in-process cache?")
+        self.assertEqual(task.branch_name, "Jiffy/add-cache")
+        self.assertIsNone(task.error_message)
+
+        mock_cb.assert_called_once()
+        kwargs = mock_cb.call_args.kwargs
+        self.assertEqual(kwargs["status"], "question")
+        self.assertEqual(kwargs["question"], "Redis or in-process cache?")
+
+    @patch("jobs.tasks.send_fallback_callback")
+    @patch("jobs.tasks.ensure_sandbox_image")
+    @patch("jobs.tasks.read_agent_result")
+    @patch("jobs.tasks.run_agent_in_container")
+    @patch("jobs.tasks.clone_repo_in_container")
+    @patch("jobs.tasks.start_generic_sandbox_container")
+    @patch("jobs.tasks.load_payload_from_redis")
+    def test_agent_delivered_question_skips_the_gateway_callback(
+        self, mock_load, mock_container, mock_clone, mock_run, mock_result, mock_ensure, mock_cb
+    ):
+        task = self._create_task()
+        mock_load.return_value = {
+            "repo": {"url": "https://github.com/user/repo", "token": "ghp_test"},
+            "issue": {"text": "Do the thing", "external_issue_id": "100"},
+            "callback": {"url": "https://example.com/cb", "secret": "sec"},
+        }
+        mock_container.return_value.__enter__ = MagicMock(return_value=MagicMock())
+        mock_container.return_value.__exit__ = MagicMock(return_value=False)
+        mock_result.return_value = AgentResult(
+            status="question",
+            branch_name=None,
+            pr_url=None,
+            programming_language=None,
+            summary=None,
+            technical_report=None,
+            error_message=None,
+            model="test/model",
+            callback={"attempted": True, "succeeded": True, "error": None},
+            question="Which environment should this target?",
+        )
+
+        from jobs.tasks import execute_task
+
+        execute_task(task.id)
+
+        task.refresh_from_db()
+        self.assertEqual(task.status, "needs_input")
+        mock_cb.assert_not_called()
