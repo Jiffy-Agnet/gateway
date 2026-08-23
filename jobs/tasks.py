@@ -13,11 +13,10 @@ from jobs.callback_specs import build_sandbox_callback_config, get_callback_spec
 from jobs.execution.agent import (
     AgentResult,
     build_agent_instructions,
-    build_inline_instructions,
+    build_task_document,
     read_agent_result,
 )
 from jobs.execution.container import (
-    MAX_INLINE_INSTRUCTIONS_BYTES,
     clone_repo_in_container,
     ensure_sandbox_image,
     run_agent_in_container,
@@ -362,9 +361,7 @@ def execute_task(self, task_id: int) -> None:
             # Running — agent does everything from here
             _update_status(task, "running")
             instructions = build_agent_instructions(payload)
-            inline_instructions = build_inline_instructions(
-                payload, instructions, MAX_INLINE_INSTRUCTIONS_BYTES
-            )
+            task_document = build_task_document(payload, task_id=task_id)
             try:
                 callback_config = build_sandbox_callback_config(
                     get_callback_spec(task.provider),
@@ -382,14 +379,10 @@ def execute_task(self, task_id: int) -> None:
                     "without the callback wrapper",
                     provider=task.provider,
                 )
-            # Size is logged so a prompt that arrives at the agent truncated is
-            # visible in one line rather than inferred from the agent asking
-            # what the task was.
             _task_log(
                 task_id,
                 logging.INFO,
-                "Status → running — handing off to agent (%d bytes of instructions)",
-                len(instructions.encode("utf-8")),
+                "Status → running — handing off to agent",
                 provider=task.provider,
             )
             run_agent_in_container(
@@ -397,7 +390,7 @@ def execute_task(self, task_id: int) -> None:
                 instructions,
                 task_id=task_id,
                 callback_config=callback_config,
-                inline_instructions=inline_instructions,
+                task_document=task_document,
             )
 
             # Read result

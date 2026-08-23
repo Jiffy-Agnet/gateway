@@ -833,8 +833,12 @@ def _wait_for_exec(
 # Agent instructions staging
 # ---------------------------------------------------------------------------
 
-# Where the full instructions text is staged inside the container.
-INSTRUCTIONS_PATH = "/tmp/jiffy_instructions.txt"
+# The complete task, as JSON, staged inside the container. This file is the
+# single source of truth for what was asked: the prompt points at it, and its
+# ``issue_text`` field always holds the whole verbatim thread no matter how
+# large. ``opencode run`` can only receive a prompt through argv, which the
+# kernel caps at 128 KiB, so the task itself must travel by file.
+TASK_JSON_PATH = "/tmp/jiffy_task.json"
 
 # The deterministic callback sender staged alongside it, and the config that
 # tells it where to post and how hard to retry.  The script is staged per run
@@ -846,13 +850,6 @@ SANDBOX_CALLBACK_SCRIPT_SOURCE = (
     Path(__file__).resolve().parent / "sandbox_scripts" / "jiffy_callback.py"
 )
 
-# The Linux kernel caps a *single* argv entry at MAX_ARG_STRLEN (32 pages =
-# 128 KiB); anything longer makes execve fail with E2BIG. An issue thread is
-# the whole conversation — issue body plus every comment — so a busy thread
-# can blow past that on its own. Instructions up to this size are passed to
-# the agent inline as before; beyond it they are handed over by path (see
-# ``build_agent_command``) so no thread is ever too large to run.
-MAX_INLINE_INSTRUCTIONS_BYTES = 96 * 1024
 
 
 def stage_file_in_container(
@@ -922,9 +919,13 @@ def _verify_staged_size(container: Container, path: str, expected_bytes: int) ->
         )
 
 
-def write_instructions_file(container: Container, instructions: str) -> None:
-    """Stage the instructions text at ``INSTRUCTIONS_PATH`` inside *container*."""
-    stage_file_in_container(container, INSTRUCTIONS_PATH, instructions)
+def write_task_document(container: Container, task_document: Dict[str, Any]) -> None:
+    """Stage the complete task at ``TASK_JSON_PATH`` inside *container*."""
+    stage_file_in_container(
+        container,
+        TASK_JSON_PATH,
+        json.dumps(task_document, ensure_ascii=False, indent=2),
+    )
 
 
 def stage_callback_wrapper(
@@ -960,12 +961,10 @@ def stage_callback_wrapper(
     )
 
 
-# Where the argv copy of the prompt is staged. ``opencode run`` takes its
-# prompt from argv only — no stdin, no prompt-file flag — so the prompt is
-# read back out of this file by the shell at exec time. Keeping it separate
-# from INSTRUCTIONS_PATH means the file the agent is told to read always holds
-# the complete thread, even when the argv copy had to be trimmed to fit.
-INLINE_PROMPT_PATH = "/tmp/jiffy_prompt.txt"
+# Where the prompt is staged. ``opencode run`` takes its prompt from argv only,
+# so the shell reads it back out of this file at exec time rather than the
+# Gateway embedding it in a command string (which would be an argv entry too).
+PROMPT_PATH = "/tmp/jiffy_prompt.txt"
 
 
 def build_agent_command() -> str:
@@ -977,36 +976,33 @@ def build_agent_command() -> str:
     """
     return (
         f"cd {WORKSPACE} && "
-        f'opencode run --auto "$(cat {INLINE_PROMPT_PATH})" > /proc/1/fd/1 2>&1'
+        f'opencode run --auto "$(cat {PROMPT_PATH})" > /proc/1/fd/1 2>&1'
     )
 
 
-def _log_prompt_delivery(full: str, inline: str, task_id: int) -> None:
+def _log_prompt_delivery(
+    task_document: Dict[str, Any] | None,
+    prompt: str,
+    task_id: int,
+) -> None:
     """Record exactly what was handed to the agent.
 
     One line that settles, after the fact, whether the agent received the whole
     request — instead of having to infer it from what the agent then said.
     """
-    full_bytes = len(full.encode("utf-8"))
-    inline_bytes = len(inline.encode("utf-8"))
-    digest = hashlib.sha256(full.encode("utf-8")).hexdigest()[:12]
-    if inline_bytes == full_bytes:
-        logger.info(
-            "[%d] Prompt delivered in full: %d bytes inline (sha256:%s)",
-            task_id,
-            full_bytes,
-            digest,
-        )
-    else:
-        logger.warning(
-            "[%d] Prompt too large for argv: %d bytes staged at %s, %d bytes "
-            "inline with a pointer to the full copy (sha256:%s)",
-            task_id,
-            full_bytes,
-            INSTRUCTIONS_PATH,
-            inline_bytes,
-            digest,
-        )
+    issue_text = (task_document or {}).get("issue_text", "")
+    issue_bytes = len(issue_text.encode("utf-8"))
+    digest = hashlib.sha256(issue_text.encode("utf-8")).hexdigest()[:12]
+    logger.info(
+        "[%d] Task handed off: issue_text=%d bytes (sha256:%s) staged at %s, "
+        "prompt=%d bytes, request text %s in the prompt",
+        task_id,
+        issue_bytes,
+        digest,
+        TASK_JSON_PATH,
+        len(prompt.encode("utf-8")),
+        "inlined" if (task_document or {}).get("issue_text_inlined") else "by reference",
+    )
 
 
 def run_agent_in_container(
@@ -1015,7 +1011,7 @@ def run_agent_in_container(
         task_id: int = 0,
         timeout_seconds: int | None = None,
         callback_config: Dict[str, Any] | None = None,
-        inline_instructions: str | None = None,
+        task_document: Dict[str, Any] | None = None,
 ) -> None:
     """Run the coding agent inside the container with the given instructions."""
     effective_timeout = timeout_seconds or getattr(
@@ -1025,14 +1021,14 @@ def run_agent_in_container(
     logger.info("[%d] Running agent in container %s (timeout=%ds, model=%s)", task_id, container.short_id,
                 effective_timeout, model)
 
-    # The staged file always holds the complete instructions; the argv copy may
-    # be a trimmed variant that still points at the file (see
-    # ``build_inline_instructions``). Both are verified after upload, so a
-    # truncated prompt fails the task here instead of surfacing later as the
-    # agent asking what the task was.
-    write_instructions_file(container, instructions)
-    stage_file_in_container(container, INLINE_PROMPT_PATH, inline_instructions or instructions)
-    _log_prompt_delivery(instructions, inline_instructions or instructions, task_id)
+    # The task JSON always carries the whole request; the prompt carries the
+    # contract and, when it fits, a copy of the request text. Both are verified
+    # after upload, so a truncated hand-off fails the task here instead of
+    # surfacing later as the agent saying the message looks cut off.
+    if task_document is not None:
+        write_task_document(container, task_document)
+    stage_file_in_container(container, PROMPT_PATH, instructions)
+    _log_prompt_delivery(task_document, instructions, task_id)
 
     if callback_config:
         stage_callback_wrapper(container, callback_config, task_id=task_id)

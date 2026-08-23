@@ -1,4 +1,5 @@
 """Handles agent instructions and result parsing."""
+import hashlib
 import json
 import logging
 import re
@@ -8,7 +9,7 @@ from docker.models.containers import Container
 
 from apps.ingestion.callback import QUESTION_TAG
 from jobs.callback_specs import get_callback_spec
-from jobs.execution.container import CALLBACK_SCRIPT_PATH, INSTRUCTIONS_PATH
+from jobs.execution.container import CALLBACK_SCRIPT_PATH, TASK_JSON_PATH, WORKSPACE
 from jobs.execution.exceptions import AgentError
 
 logger = logging.getLogger(__name__)
@@ -93,40 +94,91 @@ def _extract_suggested_areas(issue_text: str) -> str | None:
     return content or None
 
 
-def _truncate_issue_text(issue_text: str, max_bytes: int) -> str:
-    """Trim *issue_text* to *max_bytes*, leaving a pointer to the full copy.
+# How much issue text may be reproduced inside the prompt itself. ``opencode
+# run`` takes its prompt from argv only and the kernel caps a single argv entry
+# at 128 KiB (MAX_ARG_STRLEN), so anything larger has to travel by file. Small
+# models follow a task far better when it is right in front of them, so the
+# common case still inlines it.
+MAX_INLINE_ISSUE_TEXT_BYTES = 48 * 1024
 
-    Only ever used for the argv copy of the prompt. The staged file always
-    holds the whole thread, and the notice says so, so the agent is never left
-    guessing whether it has the whole request.
+
+def build_task_document(payload: Dict[str, Any], task_id: int = 0) -> Dict[str, Any]:
+    """The complete task, as the JSON document staged inside the container.
+
+    This is the single source of truth for what was asked. It carries the whole
+    thread however large it is, so nothing about the request depends on what
+    fits in the agent's argv. It deliberately carries no credentials: the repo
+    token is container env, and the callback secret lives in the callback
+    wrapper's own config.
     """
-    notice = (
-        "\n\n[... This thread is too large to include in full here. "
-        f"The COMPLETE, verbatim thread — everything above plus the rest — is "
-        f"in the file {INSTRUCTIONS_PATH} inside this container. Read that file "
-        "before you act: what follows this line in the file is part of the same "
-        "request. Do not ask anyone to re-send it. ...]"
-    )
-    budget = max_bytes - len(notice.encode("utf-8"))
-    if budget <= 0:
-        return notice.strip()
-    encoded = issue_text.encode("utf-8")[:budget]
-    # Never split a multi-byte character in half.
-    return encoded.decode("utf-8", errors="ignore") + notice
+    issue = payload.get("issue", {})
+    issue_text = _extract_issue_text(payload)
+    encoded = issue_text.encode("utf-8")
+    return {
+        "task_id": task_id,
+        "issue_text": issue_text,
+        "issue_text_bytes": len(encoded),
+        "issue_text_sha256": hashlib.sha256(encoded).hexdigest(),
+        "issue_text_inlined": len(encoded) <= MAX_INLINE_ISSUE_TEXT_BYTES,
+        "external_issue_id": issue.get("external_issue_id", ""),
+        "turns": issue.get("turns") or [],
+        "repo_url": payload.get("repo", {}).get("url", ""),
+        "workspace": WORKSPACE,
+        "result_path": AGENT_RESULT_PATH,
+    }
 
 
-def build_agent_instructions(
-    payload: Dict[str, Any],
-    issue_text_limit: int | None = None,
-) -> str:
+def _issue_section(issue_text: str, suggested_areas: str | None) -> str:
+    """The part of the prompt that carries — or points at — the request.
+
+    When the text fits it is reproduced between markers, so the agent has it
+    without reading anything. When it does not, the prompt says plainly that
+    the text is not here and gives the exact command to read it. What it never
+    does is render an empty or half-filled fenced region: that is what made the
+    agent report the message looked cut off and ask for the task to be re-sent.
+    """
+    encoded = issue_text.encode("utf-8")
+    if len(encoded) <= MAX_INLINE_ISSUE_TEXT_BYTES:
+        return f"""\
+The complete task is stored as JSON at `{TASK_JSON_PATH}` in this container —
+that file is the source of truth, and its `issue_text` field holds the full,
+verbatim request. The very same text is reproduced between the markers below,
+so you can start without reading anything.
+
+If you can see {ISSUE_END_MARKER}, you have the whole request — however short
+it looks. Never ask anyone to re-send or complete it; if you ever doubt what
+you have, read `{TASK_JSON_PATH}` instead of asking.
+
+{ISSUE_BEGIN_MARKER}
+{issue_text}
+{ISSUE_END_MARKER}
+"""
+
+    return f"""\
+**The task text is not in this message.** It is {len(encoded)} bytes — too
+large to pass through the agent's argv — so it is stored in full at
+`{TASK_JSON_PATH}` in this container. Nothing is missing and nothing needs
+re-sending; it simply lives in a file.
+
+**Before you do anything else, read it:**
+
+    python3 -c "import json;print(json.load(open('{TASK_JSON_PATH}'))['issue_text'])"
+
+That prints the complete, verbatim request. Read all of it, then carry it out.
+Do not ask anyone to provide, repeat or complete the task text — you already
+have it, in that file.
+"""
+
+
+def build_agent_instructions(payload: Dict[str, Any]) -> str:
     """Build the instructions text handed to the coding agent.
 
     The instructions are agent-agnostic — they describe the contract without
     assuming any particular CLI conventions.
 
-    ``issue_text_limit`` caps the *issue text only*, for the copy that has to
-    fit in the agent's argv; the surrounding contract is never trimmed. Leave
-    it unset for the full text, which is what gets staged to disk.
+    The contract is always complete. The request text is reproduced inline when
+    it fits in the agent's argv, and otherwise pointed at by path — the full
+    text always reaches the container as ``build_task_document``.
     """
     issue_text = _extract_issue_text(payload)
     if not issue_text.strip():
@@ -139,8 +191,6 @@ def build_agent_instructions(
             "request: check that the ingestion payload carried a non-empty "
             "'issue.turns[].body' or 'issue.text'."
         )
-    if issue_text_limit is not None and len(issue_text.encode("utf-8")) > issue_text_limit:
-        issue_text = _truncate_issue_text(issue_text, issue_text_limit)
     suggested_areas = _extract_suggested_areas(issue_text)
     provider = payload.get("repo", {}).get("provider_hint", "github")
     callback_url = payload.get("callback", {}).get("url", "")
@@ -182,23 +232,21 @@ def build_agent_instructions(
             "paths if it leads you elsewhere.\n"
         )
 
+    issue_section = _issue_section(issue_text, suggested_areas)
+
     return f"""\
 You are a coding agent working in an isolated sandbox environment.
 
+Nobody is reading your chat output. Nothing you say in a reply reaches the
+person who asked: the only two things that leave this container are the file
+you write at `{AGENT_RESULT_PATH}` and the comment the callback wrapper posts.
+Answering in chat instead of doing those is the same as doing nothing.
+
 ## Issue / Request
 
-Between the two markers below is the full, verbatim text of the task you must
-complete. Do not summarize or pre-parse it — implement exactly what it asks for.
+Do not summarize or pre-parse the request — implement exactly what it asks for.
 
-The markers are an integrity check: if you can see `{ISSUE_END_MARKER}`, you have
-the whole request, however short it looks, and there is nothing missing to ask
-about. If the end marker is absent, your copy was truncated in transit — read
-the complete text from `{INSTRUCTIONS_PATH}` and work from that instead. Either
-way, never ask the requester to re-send or complete the task text.
-
-{ISSUE_BEGIN_MARKER}
-{issue_text}
-{ISSUE_END_MARKER}
+{issue_section}
 
 ## Working Directory
 
@@ -251,6 +299,11 @@ You own the entire rest of the workflow. Specifically:
 8. **Report back** — *after* completing the above (whether you succeeded or
    partially succeeded), you MUST run the staged callback wrapper to post your
    result to the issue thread. See "Callback Delivery" below for details.
+9. **Write the result file** at `{AGENT_RESULT_PATH}`. This is not optional and
+   it is not the same thing as answering in chat: a run that ends without this
+   file on disk is recorded as a failure no matter how much work you did. Write
+   it last, and write it even if something went wrong — see "Required Final
+   Output" below for the exact fields.
 
 ## Asking a Question — Last Resort Only
 
@@ -281,14 +334,13 @@ external decision you cannot obtain, or the request has two plausible readings
 that lead to genuinely different work and nothing in the repo favours either.
 
 Never ask about the task text itself. In particular, never ask the requester to
-re-send, repeat, clarify or "complete" the issue text on the grounds that what
-you received looks short, cut off, or incomplete. The complete, verbatim text
-is always on disk at `{INSTRUCTIONS_PATH}`, and the issue section above is
-delimited by explicit `{ISSUE_BEGIN_MARKER}` / `{ISSUE_END_MARKER}` markers. If you
-do not see the end marker, your copy of the prompt was truncated in transit —
-read `{INSTRUCTIONS_PATH}` in full and work from that. If the text genuinely is
-short, that is simply how the requester wrote it: treat it as the whole request
-and implement it.
+re-send, repeat, clarify or "complete" the request on the grounds that what you
+received looks short, cut off, or incomplete. The complete, verbatim text is
+always on disk at `{TASK_JSON_PATH}`, under the `issue_text` key. If anything
+about the request looks missing to you, read that file — the answer is always
+there, and asking for it back is always wrong. If the request genuinely is
+short, that is simply how it was written: treat it as the whole request and
+implement it.
 
 If you do have to ask, ask well: one message covering everything you need, each
 question stated with what you already tried and understood, and concrete options
@@ -469,37 +521,37 @@ your run as a failure.
 """
 
 
-def build_inline_instructions(
-    payload: Dict[str, Any],
-    full_instructions: str,
-    max_bytes: int,
-) -> str:
-    """The copy of the prompt that goes in the agent's argv.
+# How much of the agent's own output to keep when it ends without a result
+# file. Enough to see what it was doing, bounded so a chatty run cannot flood
+# the worker log.
+AGENT_OUTPUT_TAIL_BYTES = 4000
 
-    ``opencode run`` takes its prompt from argv only — no stdin, no
-    prompt-file flag — and the kernel caps a single argv entry at
-    MAX_ARG_STRLEN. When the full prompt fits, it is used unchanged. When it
-    does not, the *issue text* is trimmed to fit while the whole contract
-    around it is preserved, and the trimmed region says where the complete
-    thread is. The agent therefore always receives a valid, self-contained
-    prompt with the start of the real request in it — never a bare pointer it
-    has to act on faith.
+
+def _log_agent_output_tail(container: Container) -> None:
+    """Log the tail of the agent's output. Never raises — this is diagnostics.
+
+    Deliberately worker-log only: the transcript is unfiltered agent output and
+    has no business being posted to a public issue thread.
     """
-    if len(full_instructions.encode("utf-8")) <= max_bytes:
-        return full_instructions
+    try:
+        raw = container.logs(tail=60)
+        text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        logger.warning("Could not read agent output from container: %s", exc)
+        return
 
-    issue_text = _extract_issue_text(payload)
-    overhead = len(full_instructions.encode("utf-8")) - len(issue_text.encode("utf-8"))
-    budget = max_bytes - overhead
-    if budget <= 0:
-        # The contract alone does not fit; nothing sensible left to trim.
-        logger.error(
-            "Instruction template alone exceeds the inline budget (%d > %d bytes)",
-            overhead,
-            max_bytes,
+    tail = text[-AGENT_OUTPUT_TAIL_BYTES:].strip()
+    if not tail:
+        logger.warning(
+            "Agent produced no result file and no output at all — it may have "
+            "exited before starting"
         )
-        budget = 1
-    return build_agent_instructions(payload, issue_text_limit=budget)
+        return
+    logger.warning(
+        "Agent ended without a result file. Last %d chars of its output:\n%s",
+        len(tail),
+        tail,
+    )
 
 
 def read_agent_result(container: Container) -> AgentResult:
@@ -549,6 +601,11 @@ def read_agent_result(container: Container) -> AgentResult:
             cmd=["cat", AGENT_RESULT_PATH], demux=True
         )
         if exit_code != 0:
+            # The agent ended without writing its contract. Whatever it did say
+            # went to the container log and is about to be thrown away with the
+            # container, so keep a bounded tail of it in the worker log — that
+            # is the only record of why the run went nowhere.
+            _log_agent_output_tail(container)
             return _make_result(
                 status="failed",
                 error_message=(

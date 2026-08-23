@@ -10,6 +10,7 @@ from django.test import TestCase, override_settings
 
 from apps.ingestion.callback import QUESTION_TAG, format_callback_body
 from jobs.execution.agent import (
+    build_task_document,
     ISSUE_BEGIN_MARKER,
     ISSUE_END_MARKER,
     AgentResult,
@@ -19,7 +20,7 @@ from jobs.execution.agent import (
     _format_turns,
 )
 from jobs.execution.container import (
-    INSTRUCTIONS_PATH,
+    TASK_JSON_PATH,
     _apply_network_restriction,
     _apply_pnpm_limits,
     _build_network_restriction_script,
@@ -1451,9 +1452,10 @@ class AgentQuestionTest(TestCase):
     def test_instructions_forbid_asking_about_a_truncated_prompt(self):
         """The one question never worth asking: "re-send me the task"."""
         instructions = self._instructions()
-        self.assertIn("never ask the requester to re-send", instructions)
-        self.assertIn("looks short, cut off, or incomplete", instructions)
-        self.assertIn(INSTRUCTIONS_PATH, instructions)
+        collapsed = " ".join(instructions.split())
+        self.assertIn("never ask the requester to re-send", collapsed)
+        self.assertIn("looks short, cut off, or incomplete", collapsed)
+        self.assertIn(TASK_JSON_PATH, instructions)
 
     def test_issue_text_is_fenced_by_integrity_markers(self):
         """Seeing the end marker is how the agent knows nothing was truncated."""
@@ -1461,11 +1463,19 @@ class AgentQuestionTest(TestCase):
         fenced = instructions.split(ISSUE_BEGIN_MARKER)[1].split(ISSUE_END_MARKER)[0]
         self.assertEqual(fenced.strip(), "Fix the login bug")
 
-    def test_a_huge_thread_is_still_fully_fenced(self):
+    def test_a_huge_thread_travels_in_the_task_file_not_the_prompt(self):
+        """Above the inline budget the text moves to the file, whole."""
         body = "line of issue text\n" * 100_000
         instructions = self._instructions(body)
-        fenced = instructions.split(ISSUE_BEGIN_MARKER)[1].split(ISSUE_END_MARKER)[0]
-        self.assertEqual(fenced.strip(), body.strip())
+        self.assertNotIn(ISSUE_BEGIN_MARKER, instructions)
+        self.assertIn(TASK_JSON_PATH, instructions)
+
+        document = build_task_document({
+            "repo": {"url": "https://github.com/user/repo"},
+            "issue": {"text": body, "external_issue_id": "1"},
+            "callback": {"url": "https://example.com/cb", "secret": "sec"},
+        })
+        self.assertEqual(document["issue_text"], body)
 
     def test_empty_issue_text_is_flagged_by_the_gateway(self):
         """An empty request is a Gateway/edge bug, not something to ask about."""
