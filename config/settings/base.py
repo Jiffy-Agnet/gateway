@@ -28,7 +28,7 @@ _allowed_hosts_raw = os.environ.get("ALLOWED_HOSTS", "")
 ALLOWED_HOSTS = [h.strip() for h in _allowed_hosts_raw.split(",") if h.strip()] if _allowed_hosts_raw else ["localhost", "127.0.0.1"]
 
 
-__version__ = "0.3.0-rc.4"
+__version__ = "0.3.0-rc.5"
 
 def get_app_version():
     try:

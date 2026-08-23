@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.3.0-rc.5 (2026-08-23)
+
+### Bug Fixes
+
+- **agent**: Always inline the request and forbid asking questions
+  ([`4dc7bbb`](https://github.com/Jiffy-Agnet/gateway/commit/4dc7bbb622d261948ef7b8f3101f80b7c349723f))
+
+
 ## v0.3.0-rc.4 (2026-08-23)
 
 ### Bug Fixes
