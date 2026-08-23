@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.3.0-rc.4 (2026-08-23)
+
+### Bug Fixes
+
+- **agent**: Carry the task in /tmp/jiffy_task.json instead of the prompt
+  ([`d68adc0`](https://github.com/Jiffy-Agnet/gateway/commit/d68adc018e3063ee9d3d5328ac2454017e37871d))
+
+
 ## v0.3.0-rc.3 (2026-08-23)
 
 ### Bug Fixes
