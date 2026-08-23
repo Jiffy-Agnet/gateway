@@ -13,9 +13,11 @@ from jobs.callback_specs import build_sandbox_callback_config, get_callback_spec
 from jobs.execution.agent import (
     AgentResult,
     build_agent_instructions,
+    build_inline_instructions,
     read_agent_result,
 )
 from jobs.execution.container import (
+    MAX_INLINE_INSTRUCTIONS_BYTES,
     clone_repo_in_container,
     ensure_sandbox_image,
     run_agent_in_container,
@@ -360,6 +362,9 @@ def execute_task(self, task_id: int) -> None:
             # Running — agent does everything from here
             _update_status(task, "running")
             instructions = build_agent_instructions(payload)
+            inline_instructions = build_inline_instructions(
+                payload, instructions, MAX_INLINE_INSTRUCTIONS_BYTES
+            )
             try:
                 callback_config = build_sandbox_callback_config(
                     get_callback_spec(task.provider),
@@ -392,6 +397,7 @@ def execute_task(self, task_id: int) -> None:
                 instructions,
                 task_id=task_id,
                 callback_config=callback_config,
+                inline_instructions=inline_instructions,
             )
 
             # Read result

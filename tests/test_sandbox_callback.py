@@ -32,6 +32,7 @@ from jobs.execution.container import (
     stage_callback_wrapper,
 )
 from jobs.execution.exceptions import ContainerError
+from tests.support import sandbox_container_mock, staged_files
 
 
 def _load_wrapper():
@@ -308,17 +309,10 @@ class StagingTest(TestCase):
     """The wrapper has to actually reach the container."""
 
     def _staged(self, container):
-        staged = {}
-        for call in container.put_archive.call_args_list:
-            directory, archive = call.args
-            with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-                for member in tar.getmembers():
-                    path = f"{directory.rstrip('/')}/{member.name}"
-                    staged[path] = tar.extractfile(member).read().decode("utf-8")
-        return staged
+        return staged_files(container)
 
     def test_script_and_config_are_uploaded(self):
-        container = MagicMock()
+        container = sandbox_container_mock()
         config = build_sandbox_callback_config(
             get_callback_spec("github"), callback_url="https://x/cb", callback_secret="s"
         )
@@ -334,25 +328,21 @@ class StagingTest(TestCase):
         self.assertEqual(json.loads(staged[CALLBACK_CONFIG_PATH])["url"], "https://x/cb")
 
     def test_script_is_staged_executable(self):
-        container = MagicMock()
+        container = sandbox_container_mock()
         stage_callback_wrapper(container, {"url": "https://x/cb"}, task_id=1)
         directory, archive = container.put_archive.call_args_list[0].args
         with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
             self.assertEqual(tar.getmembers()[0].mode, 0o755)
 
     def test_upload_rejection_raises(self):
-        container = MagicMock()
+        container = sandbox_container_mock()
+        container.put_archive.side_effect = None
         container.put_archive.return_value = False
         with self.assertRaises(ContainerError):
             stage_callback_wrapper(container, {"url": "https://x/cb"}, task_id=1)
 
     def test_run_stages_the_wrapper_before_the_agent_starts(self):
-        container = MagicMock()
-        container.short_id = "abc123"
-        container.exec_run.return_value = (0, (b'{"model": "m"}', b""))
-        api = container.client.api
-        api.exec_create.return_value = {"Id": "exec-1"}
-        api.exec_inspect.side_effect = [{"Running": False, "ExitCode": 0}]
+        container = sandbox_container_mock([{"Running": False, "ExitCode": 0}])
 
         config = build_sandbox_callback_config(
             get_callback_spec("github"), callback_url="https://x/cb", callback_secret="s"
@@ -363,12 +353,7 @@ class StagingTest(TestCase):
 
     def test_run_without_a_config_stages_only_the_instructions(self):
         """An unknown provider still runs; the Gateway fallback covers reporting."""
-        container = MagicMock()
-        container.short_id = "abc123"
-        container.exec_run.return_value = (0, (b'{"model": "m"}', b""))
-        api = container.client.api
-        api.exec_create.return_value = {"Id": "exec-1"}
-        api.exec_inspect.side_effect = [{"Running": False, "ExitCode": 0}]
+        container = sandbox_container_mock([{"Running": False, "ExitCode": 0}])
 
         run_agent_in_container(container, "do it", task_id=1)
 
@@ -420,7 +405,7 @@ class MissingWrapperSourceTest(TestCase):
     """A missing script must fail as a clear execution error, not a stray OSError."""
 
     def test_unreadable_source_raises_container_error(self):
-        container = MagicMock()
+        container = sandbox_container_mock()
         with patch(
             "jobs.execution.container.SANDBOX_CALLBACK_SCRIPT_SOURCE",
             Path("/nonexistent/jiffy_callback.py"),
