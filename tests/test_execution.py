@@ -1429,59 +1429,43 @@ class AgentQuestionTest(TestCase):
             "callback": {"url": "https://example.com/cb", "secret": "sec"},
         })
 
-    def test_instructions_tell_the_agent_how_to_ask(self):
-        instructions = self._instructions()
-        self.assertIn("## Asking a Question", instructions)
-        self.assertIn('`"question"`', instructions)
-        self.assertIn("❓ Jiffy has a question before continuing.", instructions)
-
-    def test_instructions_make_asking_a_last_resort(self):
-        """Asking costs a human round trip, so the prompt must push back on it."""
-        instructions = self._instructions()
-        section = instructions[instructions.index("## Asking a Question"):]
-        section = section[: section.index("## Callback Delivery")]
-        for expected in (
-            "Last Resort Only",
-            "Searched the repository",
-            "does not depend on the answer",
-            "reasonable default",
-            "write down the assumption",
-        ):
-            self.assertIn(expected, section)
-
-    def test_instructions_forbid_asking_about_a_truncated_prompt(self):
-        """The one question never worth asking: "re-send me the task"."""
+    def test_instructions_forbid_asking_entirely(self):
+        """No human is watching a run, so a question is a run that did nothing."""
         instructions = self._instructions()
         collapsed = " ".join(instructions.split())
-        self.assertIn("never ask the requester to re-send", collapsed)
-        self.assertIn("looks short, cut off, or incomplete", collapsed)
-        self.assertIn(TASK_JSON_PATH, instructions)
+        self.assertIn("## When Something Is Unclear", instructions)
+        self.assertIn("Never ask a question. There is nobody to answer it.", collapsed)
+        self.assertNotIn("Asking a Question", instructions)
 
-    def test_issue_text_is_fenced_by_integrity_markers(self):
-        """Seeing the end marker is how the agent knows nothing was truncated."""
-        instructions = self._instructions("Fix the login bug")
-        fenced = instructions.split(ISSUE_BEGIN_MARKER)[1].split(ISSUE_END_MARKER)[0]
-        self.assertEqual(fenced.strip(), "Fix the login bug")
+    def test_instructions_tell_the_agent_to_deliver_what_it_understood(self):
+        collapsed = " ".join(self._instructions().split())
+        self.assertIn(
+            "Whatever you understood of the request, implement it — completely.",
+            collapsed,
+        )
+        self.assertIn("Do every part you do understand", collapsed)
+        self.assertIn("Write the assumption down", collapsed)
 
-    def test_a_huge_thread_travels_in_the_task_file_not_the_prompt(self):
-        """Above the inline budget the text moves to the file, whole."""
+    def test_instructions_never_offer_a_question_status(self):
+        """The prompt must not advertise a way out that stalls the task."""
+        instructions = self._instructions()
+        self.assertNotIn('`"question"`', instructions)
+        self.assertNotIn(QUESTION_TAG, instructions)
+
+    def test_instructions_forbid_asking_for_the_request_back(self):
+        collapsed = " ".join(self._instructions().split())
+        self.assertIn("Never ask for the request to be re-sent", collapsed)
+        self.assertIn('what would you like me to work on?', collapsed)
+
+    def test_a_huge_thread_is_still_carried_whole_in_the_task_file(self):
         body = "line of issue text\n" * 100_000
-        instructions = self._instructions(body)
-        self.assertNotIn(ISSUE_BEGIN_MARKER, instructions)
-        self.assertIn(TASK_JSON_PATH, instructions)
-
         document = build_task_document({
             "repo": {"url": "https://github.com/user/repo"},
             "issue": {"text": body, "external_issue_id": "1"},
             "callback": {"url": "https://example.com/cb", "secret": "sec"},
         })
         self.assertEqual(document["issue_text"], body)
-
-    def test_empty_issue_text_is_flagged_by_the_gateway(self):
-        """An empty request is a Gateway/edge bug, not something to ask about."""
-        with self.assertLogs("jobs.execution.agent", level="WARNING") as cm:
-            _extract_issue_text({"issue": {"text": "   ", "external_issue_id": "55"}})
-        self.assertIn("produced no text", "".join(cm.output))
+        self.assertTrue(document["issue_text_elided_in_prompt"])
 
     def test_question_body_carries_the_tag(self):
         body = format_callback_body(
@@ -1496,10 +1480,6 @@ class AgentQuestionTest(TestCase):
             )
             self.assertNotIn(QUESTION_TAG, body)
 
-    def test_instructions_require_the_tag_on_the_question_comment(self):
-        instructions = self._instructions()
-        self.assertIn(f"{QUESTION_TAG} Task #<task_id>: ❓", instructions)
-        self.assertIn("tag is mandatory", instructions)
 
     @patch("jobs.tasks.send_fallback_callback")
     @patch("jobs.tasks.ensure_sandbox_image")

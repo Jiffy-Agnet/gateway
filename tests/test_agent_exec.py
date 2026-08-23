@@ -134,14 +134,13 @@ class TaskStagingTest(TestCase):
         self.assertNotIn("ghp_secret", json.dumps(document))
         self.assertNotIn("sec", json.dumps(document.get("callback", {})))
 
-    def test_prompt_size_does_not_grow_with_the_thread(self):
-        """A huge thread must not push the prompt anywhere near the argv cap."""
-        _, small = self._run("short request")
-        _, huge = self._run("Fix it.\n" + ("history line\n" * 40000))
-        self.assertLess(len(huge[PROMPT_PATH].encode("utf-8")), 64 * 1024)
-        self.assertLess(
-            abs(len(huge[PROMPT_PATH]) - len(small[PROMPT_PATH])),
-            MAX_INLINE_ISSUE_TEXT_BYTES,
+    def test_prompt_stays_under_the_argv_cap_whatever_the_thread(self):
+        """The prompt grows with the thread but is bounded well under 128 KiB."""
+        _, huge = self._run("Fix it.\n" + ("history line\n" * 100000))
+        self.assertLess(len(huge[PROMPT_PATH].encode("utf-8")), 110 * 1024)
+        self.assertLessEqual(
+            len(huge[PROMPT_PATH].encode("utf-8")),
+            MAX_INLINE_ISSUE_TEXT_BYTES + 32 * 1024,
         )
 
     def test_the_command_stays_tiny_whatever_the_thread(self):
@@ -151,11 +150,11 @@ class TaskStagingTest(TestCase):
 
 
 class IssueSectionTest(TestCase):
-    """The prompt must never look truncated to the agent.
+    """The request must always be in the prompt, and never look truncated.
 
-    The reported failure was the agent answering "the message appears to be cut
-    off" and asking for the task to be re-sent, because the fenced region was
-    empty or the prompt was a bare pointer.
+    Two reported failures came from breaking this: an empty fenced region made
+    the agent answer "the message appears to be cut off", and a bare pointer to
+    a file made it answer "what would you like me to work on?".
     """
 
     def _instructions(self, body):
@@ -175,48 +174,51 @@ class IssueSectionTest(TestCase):
             "callback": {"url": "https://example.com/cb", "secret": "sec"},
         })
 
-    def test_a_small_request_is_inlined_between_markers(self):
-        instructions = self._instructions("Fix the deploy script")
-        fenced = instructions.split(ISSUE_BEGIN_MARKER)[1].split(ISSUE_END_MARKER)[0]
-        self.assertIn("Fix the deploy script", fenced)
+    def _fenced(self, body):
+        instructions = self._instructions(body)
+        return instructions.split(ISSUE_BEGIN_MARKER)[1].split(ISSUE_END_MARKER)[0]
 
-    def test_a_large_request_renders_no_markers_at_all(self):
-        """Empty markers are what made the agent report a cut-off message."""
-        instructions = self._instructions("Fix it.\n" + ("history line\n" * 20000))
-        self.assertNotIn(ISSUE_BEGIN_MARKER, instructions)
-        self.assertNotIn(ISSUE_END_MARKER, instructions)
+    def test_a_small_request_is_inlined_whole(self):
+        self.assertIn("Fix the deploy script", self._fenced("Fix the deploy script"))
 
-    def test_a_large_request_says_where_the_text_is_and_how_to_read_it(self):
-        instructions = self._instructions("Fix it.\n" + ("history line\n" * 20000))
-        self.assertIn("The task text is not in this message", instructions)
-        self.assertIn(TASK_JSON_PATH, instructions)
-        self.assertIn("issue_text", instructions)
-        self.assertIn("Before you do anything else, read it", instructions)
+    def test_a_large_request_is_still_inlined(self):
+        """Never a bare pointer: the agent cannot skip what is in front of it."""
+        fenced = self._fenced("Fix the deploy script.\n" + ("history line\n" * 40000))
+        self.assertIn("Fix the deploy script.", fenced)
+        self.assertGreater(len(fenced.encode("utf-8")), 1000)
 
-    def test_every_size_points_at_the_task_file(self):
-        for body in ("tiny", "Fix it.\n" + ("history line\n" * 20000)):
-            self.assertIn(TASK_JSON_PATH, self._instructions(body))
+    def test_elision_keeps_both_the_request_and_the_latest_comment(self):
+        body = (
+            "THE ORIGINAL REQUEST: add a readiness probe\n"
+            + ("history line\n" * 40000)
+            + "LATEST COMMENT: also update the docs\n"
+        )
+        fenced = self._fenced(body)
+        self.assertIn("THE ORIGINAL REQUEST: add a readiness probe", fenced)
+        self.assertIn("LATEST COMMENT: also update the docs", fenced)
 
-    def test_no_size_ever_tells_the_agent_to_ask_for_the_text(self):
-        """Both renderings must forbid the one useless question."""
-        for body in ("tiny", "Fix it.\n" + ("history line\n" * 20000)):
-            collapsed = " ".join(self._instructions(body).split())
-            self.assertIn("never ask the requester to re-send", collapsed)
-            self.assertIn(
-                "Do not ask anyone to provide, repeat or complete the task text",
-                collapsed,
-            ) if len(body) > 1000 else self.assertIn(
-                "Never ask anyone to re-send or complete it", collapsed
-            )
+    def test_elision_says_what_it_left_out_and_where_to_find_it(self):
+        fenced = self._fenced("Fix it.\n" + ("history line\n" * 40000))
+        self.assertIn("omitted here", fenced)
+        self.assertIn(TASK_JSON_PATH, fenced)
+
+    def test_the_fenced_region_is_never_empty(self):
+        for body in ("x", "short", "Fix it.\n" + ("history line\n" * 40000)):
+            self.assertTrue(self._fenced(body).strip(), "issue region rendered empty")
+
+    def test_the_prompt_stays_under_the_argv_limit(self):
+        """MAX_ARG_STRLEN is 128 KiB; leave a clear margin under it."""
+        instructions = self._instructions("Fix it.\n" + ("history line\n" * 100000))
+        self.assertLess(len(instructions.encode("utf-8")), 110 * 1024)
 
     def test_the_contract_survives_at_every_size(self):
-        for body in ("tiny", "Fix it.\n" + ("history line\n" * 20000)):
+        for body in ("tiny", "Fix it.\n" + ("history line\n" * 40000)):
             instructions = self._instructions(body)
             for section in (
                 "## Callback Delivery",
                 "## Required Final Output",
                 ".jiffy_result.json",
-                "## Asking a Question",
+                "## When Something Is Unclear",
             ):
                 self.assertIn(section, instructions)
 
