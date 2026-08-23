@@ -2,6 +2,20 @@
 
 <!-- version list -->
 
+## v0.3.0-rc.2 (2026-08-23)
+
+### Features
+
+- **agent**: Make asking a last resort and tag questions on the thread
+  ([`c006376`](https://github.com/Jiffy-Agnet/gateway/commit/c006376cd5dcbbcd77e0fb60b2bab1609b3fe06c))
+
+- **callback**: Deterministic retry wrapper for the sandbox's outbound call
+  ([`6b73583`](https://github.com/Jiffy-Agnet/gateway/commit/6b73583d9a8b436629caa164bb3396d5b8b1aa97))
+
+- **ingestion**: Remove issue size caps and let the agent ask questions
+  ([`83a3dca`](https://github.com/Jiffy-Agnet/gateway/commit/83a3dcaef3ad07cb2a2a4fc52dc0cc5ec03df641))
+
+
 ## v0.3.0-rc.1 (2026-08-21)
 
 ### Features
