@@ -8,8 +8,18 @@ from unittest.mock import MagicMock, patch
 
 from django.test import TestCase, override_settings
 
-from jobs.execution.agent import AgentResult, build_agent_instructions, read_agent_result, _extract_issue_text, _format_turns
+from apps.ingestion.callback import QUESTION_TAG, format_callback_body
+from jobs.execution.agent import (
+    ISSUE_BEGIN_MARKER,
+    ISSUE_END_MARKER,
+    AgentResult,
+    build_agent_instructions,
+    read_agent_result,
+    _extract_issue_text,
+    _format_turns,
+)
 from jobs.execution.container import (
+    INSTRUCTIONS_PATH,
     _apply_network_restriction,
     _apply_pnpm_limits,
     _build_network_restriction_script,
@@ -1354,3 +1364,213 @@ class NetworkRestrictionTest(TestCase):
         messages = [r.getMessage() for r in cm.records]
         disabled = [m for m in messages if "Network restriction DISABLED" in m]
         self.assertTrue(disabled, "Expected a DISABLED restriction log line")
+
+
+class AgentQuestionTest(TestCase):
+    """An agent that has a question must get it back onto the issue thread.
+
+    Nothing about the run is interactive, so a question the agent cannot post
+    is a question nobody ever sees.  A ``"question"`` result parks the task on
+    ``needs_input`` and relays the text as a reply — the answer arrives later
+    as a brand-new task.
+    """
+
+    def _create_task(self, **kwargs):
+        defaults = {
+            "provider": "github",
+            "repo_url": "https://github.com/user/repo",
+            "issue_external_id": "100",
+            "callback_url": "https://example.com/cb",
+            "callback_secret": "sec",
+            "status": "queued",
+        }
+        defaults.update(kwargs)
+        return Task.objects.create(**defaults)
+
+    def _container_with_result(self, result: dict):
+        container = MagicMock()
+        container.short_id = "abc123"
+        container.exec_run.return_value = (
+            0,
+            (json.dumps(result).encode(), b""),
+        )
+        return container
+
+    def test_question_result_is_parsed(self):
+        container = self._container_with_result({
+            "status": "question",
+            "branch_name": "Jiffy/add-cache",
+            "summary": "Scaffolding pushed.",
+            "question": "Redis or in-process cache?",
+            "callback": {"attempted": True, "succeeded": True, "error": None},
+        })
+        result = read_agent_result(container)
+        self.assertEqual(result.status, "question")
+        self.assertEqual(result.question, "Redis or in-process cache?")
+
+    def test_question_status_without_a_question_is_a_failure(self):
+        """A "question" nobody can read is worse than an honest failure."""
+        container = self._container_with_result({
+            "status": "question",
+            "question": "   ",
+            "callback": {"attempted": True, "succeeded": True, "error": None},
+        })
+        result = read_agent_result(container)
+        self.assertEqual(result.status, "failed")
+        self.assertIsNone(result.question)
+        self.assertIn("question", result.error_message)
+
+    def _instructions(self, text="Do the thing"):
+        return build_agent_instructions({
+            "repo": {"url": "https://github.com/user/repo"},
+            "issue": {"text": text, "external_issue_id": "1"},
+            "callback": {"url": "https://example.com/cb", "secret": "sec"},
+        })
+
+    def test_instructions_tell_the_agent_how_to_ask(self):
+        instructions = self._instructions()
+        self.assertIn("## Asking a Question", instructions)
+        self.assertIn('`"question"`', instructions)
+        self.assertIn("❓ Jiffy has a question before continuing.", instructions)
+
+    def test_instructions_make_asking_a_last_resort(self):
+        """Asking costs a human round trip, so the prompt must push back on it."""
+        instructions = self._instructions()
+        section = instructions[instructions.index("## Asking a Question"):]
+        section = section[: section.index("## Callback Delivery")]
+        for expected in (
+            "Last Resort Only",
+            "Searched the repository",
+            "does not depend on the answer",
+            "reasonable default",
+            "write down the assumption",
+        ):
+            self.assertIn(expected, section)
+
+    def test_instructions_forbid_asking_about_a_truncated_prompt(self):
+        """The one question never worth asking: "re-send me the task"."""
+        instructions = self._instructions()
+        self.assertIn("never ask the requester to re-send", instructions)
+        self.assertIn("looks short, cut off, or incomplete", instructions)
+        self.assertIn(INSTRUCTIONS_PATH, instructions)
+
+    def test_issue_text_is_fenced_by_integrity_markers(self):
+        """Seeing the end marker is how the agent knows nothing was truncated."""
+        instructions = self._instructions("Fix the login bug")
+        fenced = instructions.split(ISSUE_BEGIN_MARKER)[1].split(ISSUE_END_MARKER)[0]
+        self.assertEqual(fenced.strip(), "Fix the login bug")
+
+    def test_a_huge_thread_is_still_fully_fenced(self):
+        body = "line of issue text\n" * 100_000
+        instructions = self._instructions(body)
+        fenced = instructions.split(ISSUE_BEGIN_MARKER)[1].split(ISSUE_END_MARKER)[0]
+        self.assertEqual(fenced.strip(), body.strip())
+
+    def test_empty_issue_text_is_flagged_by_the_gateway(self):
+        """An empty request is a Gateway/edge bug, not something to ask about."""
+        with self.assertLogs("jobs.execution.agent", level="WARNING") as cm:
+            _extract_issue_text({"issue": {"text": "   ", "external_issue_id": "55"}})
+        self.assertIn("produced no text", "".join(cm.output))
+
+    def test_question_body_carries_the_tag(self):
+        body = format_callback_body(
+            task_id=3, status="question", question="Which cache backend?"
+        )
+        self.assertTrue(body.startswith(QUESTION_TAG))
+
+    def test_result_bodies_do_not_carry_the_question_tag(self):
+        for status in ("done", "failed"):
+            body = format_callback_body(
+                task_id=3, status=status, summary="ok", error_message="bad"
+            )
+            self.assertNotIn(QUESTION_TAG, body)
+
+    def test_instructions_require_the_tag_on_the_question_comment(self):
+        instructions = self._instructions()
+        self.assertIn(f"{QUESTION_TAG} Task #<task_id>: ❓", instructions)
+        self.assertIn("tag is mandatory", instructions)
+
+    @patch("jobs.tasks.send_fallback_callback")
+    @patch("jobs.tasks.ensure_sandbox_image")
+    @patch("jobs.tasks.read_agent_result")
+    @patch("jobs.tasks.run_agent_in_container")
+    @patch("jobs.tasks.clone_repo_in_container")
+    @patch("jobs.tasks.start_generic_sandbox_container")
+    @patch("jobs.tasks.load_payload_from_redis")
+    def test_question_parks_the_task_and_falls_back_to_the_gateway(
+        self, mock_load, mock_container, mock_clone, mock_run, mock_result, mock_ensure, mock_cb
+    ):
+        task = self._create_task()
+        mock_load.return_value = {
+            "repo": {"url": "https://github.com/user/repo", "token": "ghp_test"},
+            "issue": {"text": "Do the thing", "external_issue_id": "100"},
+            "callback": {"url": "https://example.com/cb", "secret": "sec"},
+        }
+        mock_container.return_value.__enter__ = MagicMock(return_value=MagicMock())
+        mock_container.return_value.__exit__ = MagicMock(return_value=False)
+        mock_result.return_value = AgentResult(
+            status="question",
+            branch_name="Jiffy/add-cache",
+            pr_url=None,
+            programming_language="python",
+            summary="Scaffolding pushed.",
+            technical_report=None,
+            error_message=None,
+            model="test/model",
+            callback={"attempted": False, "succeeded": False, "error": "no network"},
+            question="Redis or in-process cache?",
+        )
+
+        from jobs.tasks import execute_task
+
+        execute_task(task.id)
+
+        task.refresh_from_db()
+        self.assertEqual(task.status, "needs_input")
+        self.assertEqual(task.question, "Redis or in-process cache?")
+        self.assertEqual(task.branch_name, "Jiffy/add-cache")
+        self.assertIsNone(task.error_message)
+
+        mock_cb.assert_called_once()
+        kwargs = mock_cb.call_args.kwargs
+        self.assertEqual(kwargs["status"], "question")
+        self.assertEqual(kwargs["question"], "Redis or in-process cache?")
+
+    @patch("jobs.tasks.send_fallback_callback")
+    @patch("jobs.tasks.ensure_sandbox_image")
+    @patch("jobs.tasks.read_agent_result")
+    @patch("jobs.tasks.run_agent_in_container")
+    @patch("jobs.tasks.clone_repo_in_container")
+    @patch("jobs.tasks.start_generic_sandbox_container")
+    @patch("jobs.tasks.load_payload_from_redis")
+    def test_agent_delivered_question_skips_the_gateway_callback(
+        self, mock_load, mock_container, mock_clone, mock_run, mock_result, mock_ensure, mock_cb
+    ):
+        task = self._create_task()
+        mock_load.return_value = {
+            "repo": {"url": "https://github.com/user/repo", "token": "ghp_test"},
+            "issue": {"text": "Do the thing", "external_issue_id": "100"},
+            "callback": {"url": "https://example.com/cb", "secret": "sec"},
+        }
+        mock_container.return_value.__enter__ = MagicMock(return_value=MagicMock())
+        mock_container.return_value.__exit__ = MagicMock(return_value=False)
+        mock_result.return_value = AgentResult(
+            status="question",
+            branch_name=None,
+            pr_url=None,
+            programming_language=None,
+            summary=None,
+            technical_report=None,
+            error_message=None,
+            model="test/model",
+            callback={"attempted": True, "succeeded": True, "error": None},
+            question="Which environment should this target?",
+        )
+
+        from jobs.tasks import execute_task
+
+        execute_task(task.id)
+
+        task.refresh_from_db()
+        self.assertEqual(task.status, "needs_input")
+        mock_cb.assert_not_called()

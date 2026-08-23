@@ -9,6 +9,7 @@ from django.conf import settings
 from django.db import connections
 
 from apps.ingestion.callback import send_fallback_callback
+from jobs.callback_specs import build_sandbox_callback_config, get_callback_spec
 from jobs.execution.agent import (
     AgentResult,
     build_agent_instructions,
@@ -165,6 +166,7 @@ def _handle_callback(
     branch_name: str | None = None,
     pr_url: str | None = None,
     error_message: str | None = None,
+    question: str | None = None,
 ) -> None:
     """Handle callback delivery: agent-first, Gateway fallback.
 
@@ -197,6 +199,46 @@ def _handle_callback(
         branch_name=branch_name,
         pr_url=pr_url,
         error_message=error_message,
+        question=question,
+    )
+
+
+def _ask_task(task: Task, result: AgentResult) -> None:
+    """Park a task on the agent's question and relay it to the issue thread.
+
+    Not a failure: the agent stopped rather than guess. The question is posted
+    as a reply on the originating issue, and the answer comes back as a new
+    Jiffy task with the full thread.
+    """
+    task.status = "needs_input"
+    task.question = result.question
+    task.branch_name = result.branch_name
+    task.programming_language = result.programming_language
+    task.pr_url = result.pr_url
+    task.save(
+        update_fields=[
+            "status",
+            "question",
+            "branch_name",
+            "programming_language",
+            "pr_url",
+            "updated_at",
+        ]
+    )
+    _task_log(
+        task.id,
+        logging.INFO,
+        "Agent asked a question — status → needs_input: %s",
+        result.question,
+        provider=task.provider,
+    )
+    _handle_callback(
+        task,
+        result,
+        status="question",
+        summary=result.summary,
+        branch_name=result.branch_name,
+        question=result.question,
     )
 
 
@@ -317,9 +359,40 @@ def execute_task(self, task_id: int) -> None:
 
             # Running — agent does everything from here
             _update_status(task, "running")
-            _task_log(task_id, logging.INFO, "Status → running — handing off to agent", provider=task.provider)
             instructions = build_agent_instructions(payload)
-            run_agent_in_container(container, instructions, task_id=task_id)
+            try:
+                callback_config = build_sandbox_callback_config(
+                    get_callback_spec(task.provider),
+                    callback_url=callback["url"],
+                    callback_secret=callback.get("secret", ""),
+                )
+            except KeyError:
+                # Unknown provider: the run still goes ahead, and the Gateway
+                # fallback remains the safety net for reporting.
+                callback_config = None
+                _task_log(
+                    task_id,
+                    logging.WARNING,
+                    "No callback spec for this provider — the sandbox will run "
+                    "without the callback wrapper",
+                    provider=task.provider,
+                )
+            # Size is logged so a prompt that arrives at the agent truncated is
+            # visible in one line rather than inferred from the agent asking
+            # what the task was.
+            _task_log(
+                task_id,
+                logging.INFO,
+                "Status → running — handing off to agent (%d bytes of instructions)",
+                len(instructions.encode("utf-8")),
+                provider=task.provider,
+            )
+            run_agent_in_container(
+                container,
+                instructions,
+                task_id=task_id,
+                callback_config=callback_config,
+            )
 
             # Read result
             result = read_agent_result(container)
@@ -336,6 +409,16 @@ def execute_task(self, task_id: int) -> None:
                 result.callback or "(none)",
                 provider=task.provider,
             )
+        elif result.status == "question":
+            _task_log(
+                task_id,
+                logging.INFO,
+                "Agent result: question — model=%s branch=%s callback=%s",
+                result.model or "(unknown)",
+                result.branch_name or "(none)",
+                result.callback or "(none)",
+                provider=task.provider,
+            )
         else:
             _task_log(
                 task_id,
@@ -346,6 +429,10 @@ def execute_task(self, task_id: int) -> None:
                 result.callback or "(none)",
                 provider=task.provider,
             )
+
+        if result.status == "question":
+            _ask_task(task, result)
+            return
 
         if result.status != "done":
             _fail_task(task, error_message=result.error_message or "Agent reported failure without details.", result=result)

@@ -538,3 +538,74 @@ class TestIngestionPayloadSerializer(TestCase):
         }
         serializer = IngestionPayloadSerializer(data=payload)
         self.assertTrue(serializer.is_valid(), msg=serializer.errors)
+
+
+class TestLargeIssueIngestion(TestCase):
+    """A large issue thread must be ingested whole, not rejected or clipped.
+
+    Django caps a request body at ``DATA_UPLOAD_MAX_MEMORY_SIZE`` (2.5 MiB by
+    default) and raises ``RequestDataTooBig`` from ``request.body`` — which
+    would have silently capped how much of an issue could ever reach the
+    agent.  Settings lift that cap; these tests pin it.
+    """
+
+    def setUp(self):
+        self.factory = RequestFactory()
+
+    def _payload(self, body: str):
+        return {
+            "repo": {"url": "https://github.com/user/repo", "token": "ghp_test"},
+            "issue": {
+                "turns": [
+                    {
+                        "role": "user",
+                        "author": "someone",
+                        "body": body,
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ],
+                "external_issue_id": "999",
+            },
+            "callback": {
+                "url": "https://example.com/callback",
+                "secret": "callback-secret",
+            },
+        }
+
+    def test_upload_cap_is_lifted(self):
+        from django.conf import settings
+
+        self.assertIsNone(settings.DATA_UPLOAD_MAX_MEMORY_SIZE)
+
+    @patch.dict("os.environ", {"GITHUB_INGEST_TOKEN": "test-github-secret"})
+    @patch("apps.ingestion.views.execute_task")
+    @patch("apps.ingestion.views.get_redis")
+    @patch("apps.ingestion.views.transaction")
+    def test_multi_megabyte_thread_is_accepted_and_stored_whole(
+        self, mock_transaction, mock_redis, mock_task
+    ):
+        redis_client = MagicMock(set=MagicMock(return_value=True))
+        mock_redis.return_value = redis_client
+        mock_transaction.on_commit.side_effect = lambda cb: cb()
+        mock_transaction.atomic.return_value.__enter__ = MagicMock()
+        mock_transaction.atomic.return_value.__exit__ = MagicMock(return_value=False)
+
+        # Comfortably past Django's 2.5 MiB default.
+        huge_body = "a very long comment. " * 200_000
+        body = json.dumps(self._payload(huge_body)).encode()
+        self.assertGreater(len(body), 4 * 1024 * 1024)
+
+        request = self.factory.post(
+            "/api/github/ingestion",
+            data=body,
+            content_type="application/json",
+            **{AUTH_HEADER: "test-github-secret"},
+        )
+        response = GitHubIngestView.as_view()(request)
+
+        self.assertEqual(response.status_code, 202)
+        # The payload written to Redis must carry the whole thread, untruncated.
+        stored = json.loads(
+            [c for c in redis_client.set.call_args_list if "payload" in c.args[0]][0].args[1]
+        )
+        self.assertEqual(stored["issue"]["turns"][0]["body"], huge_body)

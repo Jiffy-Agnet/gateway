@@ -122,6 +122,30 @@ def build_callback_body(spec: dict[str, Any], body_text: str) -> bytes:
     return body_text.encode("utf-8")
 
 
+def build_sandbox_callback_config(
+    spec: dict[str, Any],
+    callback_url: str,
+    callback_secret: str,
+) -> dict[str, Any]:
+    """Config for the sandbox's callback wrapper: where to post, and how to retry.
+
+    Everything the wrapper needs is resolved here, from the same spec the
+    Gateway's own sender uses, so the two cannot describe the endpoint
+    differently. The retry half comes from ``jobs.callback_retry``.
+    """
+    from jobs.callback_retry import policy_for_sandbox
+
+    config: dict[str, Any] = {
+        "method": spec["method"],
+        "url": callback_url,
+        "headers": build_callback_headers(spec, callback_secret),
+        "body_format": spec.get("body_format", "text"),
+        "body_text_field": spec.get("body_text_field", "body"),
+    }
+    config.update(policy_for_sandbox())
+    return config
+
+
 def build_callback_payload(
     spec: dict[str, Any],
     task_id: int,

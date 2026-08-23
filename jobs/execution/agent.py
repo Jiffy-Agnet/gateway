@@ -6,11 +6,25 @@ from typing import Any, Dict, NamedTuple
 
 from docker.models.containers import Container
 
+from apps.ingestion.callback import QUESTION_TAG
 from jobs.callback_specs import get_callback_spec
+from jobs.execution.container import CALLBACK_SCRIPT_PATH, INSTRUCTIONS_PATH
 
 logger = logging.getLogger(__name__)
 
 AGENT_RESULT_PATH = "/workspace/.jiffy_result.json"
+
+# Statuses the agent may report in its result file. "question" means the run
+# ended because the agent needs an answer from the requester before it can
+# continue — it is neither a success nor a failure.
+VALID_AGENT_STATUSES = ("done", "failed", "question")
+
+# The issue text is fenced by these markers so the agent can tell a short
+# request apart from a truncated one. Seeing the end marker is proof it got
+# the whole thread — which is what stops it asking the requester to "re-send
+# the task", the one question that is never worth a round trip.
+ISSUE_BEGIN_MARKER = "<<<JIFFY-ISSUE-BEGIN>>>"
+ISSUE_END_MARKER = "<<<JIFFY-ISSUE-END>>>"
 
 
 class AgentResult(NamedTuple):
@@ -23,6 +37,9 @@ class AgentResult(NamedTuple):
     error_message: str | None
     model: str | None
     callback: dict | None
+    # Trails the required fields so it can default: only a "question" status
+    # carries one.
+    question: str | None = None
 
 
 def _format_turns(turns: list[dict]) -> str:
@@ -41,8 +58,18 @@ def _extract_issue_text(payload: Dict[str, Any]) -> str:
     issue = payload.get("issue", {})
     turns = issue.get("turns")
     if turns and isinstance(turns, list) and len(turns) > 0:
-        return _format_turns(turns)
-    return issue.get("text", "")
+        text = _format_turns(turns)
+    else:
+        text = issue.get("text", "")
+    if not text.strip():
+        # The agent is about to be handed an empty request, which is the one
+        # thing guaranteed to make it ask what the task is. Say so here, where
+        # it is a Gateway/edge bug and not the requester's fault.
+        logger.warning(
+            "Issue %s produced no text — the agent will receive an empty request",
+            issue.get("external_issue_id", "?"),
+        )
+    return text
 
 
 # Matches a "Suggested codebase areas" section header (with or without a
@@ -118,12 +145,18 @@ You are a coding agent working in an isolated sandbox environment.
 
 ## Issue / Request
 
-The following is the full, verbatim text of the task you must complete. Do not
-summarize or pre-parse it — implement exactly what it asks for.
+Between the two markers below is the full, verbatim text of the task you must
+complete. Do not summarize or pre-parse it — implement exactly what it asks for.
 
----
+The markers are an integrity check: if you can see `{ISSUE_END_MARKER}`, you have
+the whole request, however short it looks, and there is nothing missing to ask
+about. If the end marker is absent, your copy was truncated in transit — read
+the complete text from `{INSTRUCTIONS_PATH}` and work from that instead. Either
+way, never ask the requester to re-send or complete the task text.
+
+{ISSUE_BEGIN_MARKER}
 {issue_text}
----
+{ISSUE_END_MARKER}
 
 ## Working Directory
 
@@ -173,20 +206,107 @@ You own the entire rest of the workflow. Specifically:
    review* — include a mention of the configured code-review bot handle in the
    PR description (if you opened a PR) or in your final result summary (if you
    did not).
-8. **Callback attempt** — *after* completing the above (whether you succeeded
-   or partially succeeded), you MUST attempt to call the callback endpoint to
-   report your result. See "Callback Delivery" below for details.
+8. **Report back** — *after* completing the above (whether you succeeded or
+   partially succeeded), you MUST run the staged callback wrapper to post your
+   result to the issue thread. See "Callback Delivery" below for details.
+
+## Asking a Question — Last Resort Only
+
+Asking costs the requester a round trip and stalls the task until a human comes
+back, so a question is a failure to be avoided, not a safety net. **Do the work.**
+Almost everything that feels like a question is answerable from the repository
+in front of you: existing patterns, tests, config, README, git history, and the
+conventions the codebase already follows are the answer to "which way should I
+do this?". Read before you ask.
+
+Before you even consider asking, you must have done all of these:
+
+1. **Searched the repository** for the answer — an existing implementation of
+   something similar is a decision already made for you.
+2. **Done every part of the task that does not depend on the answer.** A
+   question about one detail is not a reason to stop on everything else.
+3. **Looked for a reasonable default.** If one interpretation is clearly the
+   most sensible, take it, implement it, and write down the assumption in your
+   `summary` and `technical_report`. A delivered change under a stated
+   assumption is far more useful than a question. The requester can correct a
+   stated assumption in one reply; they cannot use an empty branch.
+4. **Checked that the answer would actually change what you build.** If both
+   readings lead to the same code, there is nothing to ask.
+
+Only ask when, after all of that, proceeding would be actively harmful or
+useless: it would destroy data or break production, it needs a credential or an
+external decision you cannot obtain, or the request has two plausible readings
+that lead to genuinely different work and nothing in the repo favours either.
+
+Never ask about the task text itself. In particular, never ask the requester to
+re-send, repeat, clarify or "complete" the issue text on the grounds that what
+you received looks short, cut off, or incomplete. The complete, verbatim text
+is always on disk at `{INSTRUCTIONS_PATH}`, and the issue section above is
+delimited by explicit `{ISSUE_BEGIN_MARKER}` / `{ISSUE_END_MARKER}` markers. If you
+do not see the end marker, your copy of the prompt was truncated in transit —
+read `{INSTRUCTIONS_PATH}` in full and work from that. If the text genuinely is
+short, that is simply how the requester wrote it: treat it as the whole request
+and implement it.
+
+If you do have to ask, ask well: one message covering everything you need, each
+question stated with what you already tried and understood, and concrete options
+("A or B?") rather than an open-ended prompt. You get exactly one reply, and it
+arrives as a brand-new task rather than a continuation of this run, so the
+question must stand on its own.
+
+To ask:
+
+- Set `status` to `"question"` in your result file and put the question text in
+  the `question` field.
+- Deliver it through the callback using the question format below, so it is
+  posted as a reply on the issue thread the request came from. It must carry
+  the `{QUESTION_TAG}` tag as documented there — that tag is how the thread and
+  the next run recognise the comment as a question rather than a result.
+- Commit and push whatever partial, coherent work you already have (if any) so
+  it is not lost, and report the branch. Do not open a PR for incomplete work
+  unless the issue text asked for one.
+
+Anything you ask that is not delivered through the callback is lost — nobody is
+watching your terminal and there is no interactive prompt. So a question left in
+your logs, or in your summary, is a question nobody will ever answer.
 
 ## Callback Delivery
 
-You MUST attempt exactly ONE call to the callback endpoint after finishing
-your work. Make exactly ONE attempt — do not retry. If the call fails, report
-that in your result's `callback` object.
+After finishing your work you MUST report it back to the issue thread. You do
+**not** write the HTTP call yourself: a wrapper is already staged in this
+container that owns delivery, including retries. Your job is to compose the
+comment body and run the wrapper once.
 
-The report you send must be **human-readable markdown** suitable for posting
-as an issue/PR comment. Compose it in the format below, then send it exactly
-as described under "Callback endpoint details" — that section says whether it
-goes on the wire as raw text or wrapped in a JSON field.
+    1. Write your comment body (the markdown described below) to a file, e.g.
+       /tmp/jiffy_callback_body.md
+    2. Run:  python3 {CALLBACK_SCRIPT_PATH} --body-file /tmp/jiffy_callback_body.md
+    3. Copy the single JSON object it prints on stdout verbatim into the
+       `callback` field of your result file.
+
+Rules for this step, all of them absolute:
+
+- Run the wrapper **exactly once**. It already retries transient failures on
+  its own schedule and gives up on permanent ones; running it again would post
+  a duplicate comment.
+- Do **not** write your own HTTP request, curl command, or retry loop for the
+  callback, and do not change the endpoint, headers or secret. Delivery policy
+  is not yours to decide — the wrapper is the only correct way to report.
+- Do **not** invent the `callback` object. Use exactly what the wrapper
+  printed. If the wrapper could not run at all (exit code 2), report
+  `{{"attempted": false, "succeeded": false, "error": "<what went wrong>"}}`.
+- A failed callback does **not** change your `status`. If you completed the
+  work, `status` stays `"done"` even when the comment could not be posted; the
+  Gateway notices the undelivered callback and reports it for you.
+- Still write your result file either way. It is read from the container's
+  filesystem, not over the network, so it survives any delivery failure.
+
+The wrapper prints each attempt to stderr, which is already redirected to the
+container's log, so you do not need to add logging of your own.
+
+The report you compose must be **human-readable markdown** suitable for posting
+as an issue/PR comment. Use the format below. The endpoint details at the end
+of this section are documentation of what the wrapper does — you do not need to
+apply them yourself.
 
 For a successful task:
 
@@ -211,10 +331,27 @@ Task #<task_id>: ❌ Jiffy could not complete this task.
 **Reason:** <error_message>
 ```
 
+For a task that is blocked on a question (see "Asking a Question" above):
+
+```
+{QUESTION_TAG} Task #<task_id>: ❓ Jiffy has a question before continuing.
+
+**Question:** <question>
+
+**Branch:** <branch_name>
+
+---
+
+Reply on this issue to answer — your reply starts a new Jiffy task with the
+full thread.
+```
+
 Rules:
 - If `pr_url` is null/empty, omit the **Pull Request:** line entirely.
 - If `branch_name` is null/empty, omit the **Branch:** line entirely.
 - If `technical_report` is missing or empty, omit the entire `Technical Report` section (including the `---` separator and heading) entirely.
+- In the question format, omit the **Branch:** line if you have no branch to report; keep the closing "Reply on this issue" note always.
+- The question format's leading `{QUESTION_TAG}` tag is mandatory and must be the first thing on the first line, exactly as written. It is what marks the comment as a question rather than a result; the success and failure formats must never carry it.
 - The `technical_report` field, when present, must use the following structure:
 
   ## What was done
@@ -236,7 +373,7 @@ Rules:
 
 - Use the task ID from your environment if available, or 0 as a fallback.
 
-Callback endpoint details:
+Callback endpoint details (what the wrapper sends — for reference only):
 - **URL**: {callback_url}
 - **Method**: {spec['method']}
 - **Auth header**: `{spec['auth_header']}: {spec['auth_value_prefix']}<callback_secret>`
@@ -249,8 +386,8 @@ Callback endpoint details:
 
 ## Required Final Output
 
-When you are finished — whether you succeeded or failed — you MUST produce a
-JSON file at the following path:
+When you are finished — whether you succeeded, failed, or stopped to ask a
+question — you MUST produce a JSON file at the following path:
 
     {AGENT_RESULT_PATH}
 
@@ -258,7 +395,7 @@ The file must contain exactly one JSON object with these fields:
 
 | Field                  | Type     | Required | Description |
 |------------------------|----------|----------|-------------|
-| `status`               | string   | yes      | `"done"` if the task was completed, `"failed"` if it was not. |
+| `status`               | string   | yes      | `"done"` if the task was completed, `"failed"` if it was not, `"question"` if you stopped to ask the requester something. |
 | `branch_name`          | string   | yes      | The branch you created or worked on. |
 | `branch_base`          | string   | yes      | The branch you created new branch from. |
 | `pr_url`               | string   | no       | URL of the PR/MR you opened, if any. |
@@ -266,6 +403,7 @@ The file must contain exactly one JSON object with these fields:
 | `summary`              | string   | yes      | A brief summary of what you did. |
 | `technical_report`     | string   | no       | Detailed technical report in markdown format for developer/technical reviewer. Must use the structure described in the Callback Delivery section above. |
 | `error_message`        | string   | no       | Details of what went wrong, if `status` is `"failed"`. |
+| `question`             | string   | yes if `status` is `"question"` | The question you need answered before you can continue. Required — a `"question"` status without it is treated as a failure. |
 | `callback`             | object   | yes      | Outcome of your callback attempt. See below. |
 
 ### The `callback` object
@@ -314,6 +452,7 @@ def read_agent_result(container: Container) -> AgentResult:
         summary: str | None = None,
         technical_report: str | None = None,
         error_message: str | None = None,
+        question: str | None = None,
         model: str | None = None,
         callback: dict | None = None,
     ) -> AgentResult:
@@ -325,6 +464,7 @@ def read_agent_result(container: Container) -> AgentResult:
             summary=summary,
             technical_report=technical_report,
             error_message=error_message,
+            question=question,
             model=model,
             callback=callback or {"attempted": False, "succeeded": False, "error": "No callback information available"},
         )
@@ -346,7 +486,19 @@ def read_agent_result(container: Container) -> AgentResult:
         result_data = json.loads(output)
         callback = _parse_callback(result_data)
         status = result_data.get("status")
-        if status not in ("done", "failed"):
+        question = result_data.get("question")
+        if not isinstance(question, str) or not question.strip():
+            question = None
+        # A "question" status means the agent stopped to ask for clarification
+        # rather than guessing; without a question to relay it is just a
+        # failure, so it is downgraded to one below.
+        if status == "question" and question is None:
+            status = "failed"
+            result_data.setdefault(
+                "error_message",
+                "Agent reported status 'question' without a 'question' field.",
+            )
+        if status not in VALID_AGENT_STATUSES:
             return _make_result(
                 status="failed",
                 branch_name=result_data.get("branch_name"),
@@ -356,8 +508,10 @@ def read_agent_result(container: Container) -> AgentResult:
                 technical_report=result_data.get("technical_report"),
                 error_message=(
                     result_data.get("error_message")
-                    or "Agent result JSON is missing a valid 'status' field (must be 'done' or 'failed')."
+                    or "Agent result JSON is missing a valid 'status' field "
+                    f"(must be one of: {', '.join(sorted(VALID_AGENT_STATUSES))})."
                 ),
+                question=question,
                 model=result_data.get("model"),
                 callback=callback,
             )
@@ -369,6 +523,7 @@ def read_agent_result(container: Container) -> AgentResult:
             summary=result_data.get("summary"),
             technical_report=result_data.get("technical_report"),
             error_message=result_data.get("error_message"),
+            question=question,
             model=result_data.get("model"),
             callback=callback,
         )
