@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.3.0-rc.3 (2026-08-23)
+
+### Bug Fixes
+
+- **agent**: Never hand the agent a prompt without the task in it
+  ([`e6c4844`](https://github.com/Jiffy-Agnet/gateway/commit/e6c4844f4673f2630ff12072b25be1a819bf7dbd))
+
+
 ## v0.3.0-rc.2 (2026-08-23)
 
 ### Features
