@@ -7,7 +7,6 @@ from typing import Any, Dict, NamedTuple
 
 from docker.models.containers import Container
 
-from apps.ingestion.callback import QUESTION_TAG
 from jobs.callback_specs import get_callback_spec
 from jobs.execution.container import CALLBACK_SCRIPT_PATH, TASK_JSON_PATH, WORKSPACE
 from jobs.execution.exceptions import AgentError
@@ -16,15 +15,15 @@ logger = logging.getLogger(__name__)
 
 AGENT_RESULT_PATH = "/workspace/.jiffy_result.json"
 
-# Statuses the agent may report in its result file. "question" means the run
-# ended because the agent needs an answer from the requester before it can
-# continue — it is neither a success nor a failure.
+# Statuses the agent may report in its result file. The prompt only ever asks
+# for "done" or "failed" — asking a question is forbidden there, because no
+# human is watching a run. "question" is still accepted so that a result which
+# arrives that way is relayed to the issue rather than dropped.
 VALID_AGENT_STATUSES = ("done", "failed", "question")
 
-# The issue text is fenced by these markers so the agent can tell a short
-# request apart from a truncated one. Seeing the end marker is proof it got
-# the whole thread — which is what stops it asking the requester to "re-send
-# the task", the one question that is never worth a round trip.
+# The request is fenced by these markers so the agent can tell a short request
+# apart from a truncated one. Seeing the end marker is proof it has the whole
+# thing.
 ISSUE_BEGIN_MARKER = "<<<JIFFY-ISSUE-BEGIN>>>"
 ISSUE_END_MARKER = "<<<JIFFY-ISSUE-END>>>"
 
@@ -94,12 +93,21 @@ def _extract_suggested_areas(issue_text: str) -> str | None:
     return content or None
 
 
-# How much issue text may be reproduced inside the prompt itself. ``opencode
-# run`` takes its prompt from argv only and the kernel caps a single argv entry
-# at 128 KiB (MAX_ARG_STRLEN), so anything larger has to travel by file. Small
-# models follow a task far better when it is right in front of them, so the
-# common case still inlines it.
-MAX_INLINE_ISSUE_TEXT_BYTES = 48 * 1024
+# How much issue text is reproduced inside the prompt itself. ``opencode run``
+# takes its prompt from argv only and the kernel caps a single argv entry at
+# 128 KiB (MAX_ARG_STRLEN); the surrounding contract is ~15 KiB, so this leaves
+# a wide margin. The request is ALWAYS inlined up to this size — a model handed
+# a pointer to a file instead of a task tends to answer "what would you like me
+# to work on?" rather than go and read it. Above the budget the middle is
+# elided and the head and tail are kept, so the original request and the latest
+# comments are both in front of the agent, with the complete copy in the task
+# file.
+MAX_INLINE_ISSUE_TEXT_BYTES = 80 * 1024
+
+# When eliding, how much of the budget goes to the start of the thread. The
+# opening comment is the request itself; the tail is the most recent
+# instructions. Both matter more than the middle of a long discussion.
+ELISION_HEAD_SHARE = 0.6
 
 
 def build_task_document(payload: Dict[str, Any], task_id: int = 0) -> Dict[str, Any]:
@@ -119,7 +127,7 @@ def build_task_document(payload: Dict[str, Any], task_id: int = 0) -> Dict[str, 
         "issue_text": issue_text,
         "issue_text_bytes": len(encoded),
         "issue_text_sha256": hashlib.sha256(encoded).hexdigest(),
-        "issue_text_inlined": len(encoded) <= MAX_INLINE_ISSUE_TEXT_BYTES,
+        "issue_text_elided_in_prompt": len(encoded) > MAX_INLINE_ISSUE_TEXT_BYTES,
         "external_issue_id": issue.get("external_issue_id", ""),
         "turns": issue.get("turns") or [],
         "repo_url": payload.get("repo", {}).get("url", ""),
@@ -128,45 +136,56 @@ def build_task_document(payload: Dict[str, Any], task_id: int = 0) -> Dict[str, 
     }
 
 
-def _issue_section(issue_text: str, suggested_areas: str | None) -> str:
-    """The part of the prompt that carries — or points at — the request.
+def _elide_middle(issue_text: str, max_bytes: int) -> str:
+    """Keep the head and tail of *issue_text*, marking what was left out."""
+    encoded = issue_text.encode("utf-8")
+    marker_template = (
+        "\n\n[... {omitted} bytes of the middle of this thread are omitted here "
+        f"to fit. The complete text is in `{TASK_JSON_PATH}` under `issue_text` "
+        "if you need the part that is missing. Everything above and below this "
+        "line is verbatim. ...]\n\n"
+    )
+    budget = max_bytes - len(marker_template.format(omitted=len(encoded)).encode("utf-8"))
+    head_bytes = int(budget * ELISION_HEAD_SHARE)
+    tail_bytes = budget - head_bytes
+    head = encoded[:head_bytes].decode("utf-8", errors="ignore")
+    tail = encoded[-tail_bytes:].decode("utf-8", errors="ignore")
+    omitted = len(encoded) - head_bytes - tail_bytes
+    return head + marker_template.format(omitted=omitted) + tail
 
-    When the text fits it is reproduced between markers, so the agent has it
-    without reading anything. When it does not, the prompt says plainly that
-    the text is not here and gives the exact command to read it. What it never
-    does is render an empty or half-filled fenced region: that is what made the
-    agent report the message looked cut off and ask for the task to be re-sent.
+
+def _issue_section(issue_text: str, suggested_areas: str | None) -> str:
+    """The part of the prompt that carries the request.
+
+    The request is always here, between the markers — never replaced by a
+    pointer to a file. Handing a model a path instead of a task is what
+    produced "What would you like me to work on?" and "the message appears to
+    be cut off"; a model cannot skip reading what is already in front of it.
     """
     encoded = issue_text.encode("utf-8")
     if len(encoded) <= MAX_INLINE_ISSUE_TEXT_BYTES:
-        return f"""\
-The complete task is stored as JSON at `{TASK_JSON_PATH}` in this container —
-that file is the source of truth, and its `issue_text` field holds the full,
-verbatim request. The very same text is reproduced between the markers below,
-so you can start without reading anything.
-
-If you can see {ISSUE_END_MARKER}, you have the whole request — however short
-it looks. Never ask anyone to re-send or complete it; if you ever doubt what
-you have, read `{TASK_JSON_PATH}` instead of asking.
-
-{ISSUE_BEGIN_MARKER}
-{issue_text}
-{ISSUE_END_MARKER}
-"""
+        completeness = (
+            f"This is the entire request. If you can see {ISSUE_END_MARKER}, "
+            "nothing is missing — however short it looks."
+        )
+        body = issue_text
+    else:
+        completeness = (
+            f"This thread is {len(encoded)} bytes, so the middle of it is "
+            "omitted below and the start and end are shown in full. The "
+            f"complete text is in `{TASK_JSON_PATH}` under `issue_text`; read "
+            "it only if you need the omitted middle. What is shown here is "
+            "already enough to begin."
+        )
+        body = _elide_middle(issue_text, MAX_INLINE_ISSUE_TEXT_BYTES)
 
     return f"""\
-**The task text is not in this message.** It is {len(encoded)} bytes — too
-large to pass through the agent's argv — so it is stored in full at
-`{TASK_JSON_PATH}` in this container. Nothing is missing and nothing needs
-re-sending; it simply lives in a file.
+{completeness} Nothing here needs to be re-sent and there is no one to ask:
+work from what is below.
 
-**Before you do anything else, read it:**
-
-    python3 -c "import json;print(json.load(open('{TASK_JSON_PATH}'))['issue_text'])"
-
-That prints the complete, verbatim request. Read all of it, then carry it out.
-Do not ask anyone to provide, repeat or complete the task text — you already
-have it, in that file.
+{ISSUE_BEGIN_MARKER}
+{body}
+{ISSUE_END_MARKER}
 """
 
 
@@ -305,64 +324,38 @@ You own the entire rest of the workflow. Specifically:
    it last, and write it even if something went wrong — see "Required Final
    Output" below for the exact fields.
 
-## Asking a Question — Last Resort Only
+## When Something Is Unclear
 
-Asking costs the requester a round trip and stalls the task until a human comes
-back, so a question is a failure to be avoided, not a safety net. **Do the work.**
-Almost everything that feels like a question is answerable from the repository
-in front of you: existing patterns, tests, config, README, git history, and the
-conventions the codebase already follows are the answer to "which way should I
-do this?". Read before you ask.
+**Never ask a question. There is nobody to answer it.** This run is not a
+conversation: no human is reading your output, and a reply that asks for
+clarification is simply a run that did nothing. Whatever you understood of the
+request, implement it — completely.
 
-Before you even consider asking, you must have done all of these:
+When something is ambiguous, resolve it yourself:
 
-1. **Searched the repository** for the answer — an existing implementation of
-   something similar is a decision already made for you.
-2. **Done every part of the task that does not depend on the answer.** A
-   question about one detail is not a reason to stop on everything else.
-3. **Looked for a reasonable default.** If one interpretation is clearly the
-   most sensible, take it, implement it, and write down the assumption in your
-   `summary` and `technical_report`. A delivered change under a stated
-   assumption is far more useful than a question. The requester can correct a
-   stated assumption in one reply; they cannot use an empty branch.
-4. **Checked that the answer would actually change what you build.** If both
-   readings lead to the same code, there is nothing to ask.
+- **Look in the repository.** Existing patterns, tests, config, the README and
+  git history are the answer to almost every "which way should I do this?".
+  The codebase has already made most of these decisions.
+- **Take the most reasonable reading** and build it. If two readings are
+  plausible, pick the one the codebase supports, or the smaller and more
+  easily reversed one.
+- **Write the assumption down** in your `summary` and in the `Reasoning`
+  section of your `technical_report`. A delivered change with a stated
+  assumption is useful and can be corrected in one reply; a question delivers
+  nothing.
+- **Do every part you do understand.** One unclear detail is never a reason to
+  stop on the rest. Implement everything else in full, and note the part you
+  had to interpret.
 
-Only ask when, after all of that, proceeding would be actively harmful or
-useless: it would destroy data or break production, it needs a credential or an
-external decision you cannot obtain, or the request has two plausible readings
-that lead to genuinely different work and nothing in the repo favours either.
+Never ask for the request to be re-sent, repeated, or completed, and never
+answer with "what would you like me to work on?" — the request is in this
+message, between the markers above. If you believe something is missing from
+it, you are wrong: proceed with what is there.
 
-Never ask about the task text itself. In particular, never ask the requester to
-re-send, repeat, clarify or "complete" the request on the grounds that what you
-received looks short, cut off, or incomplete. The complete, verbatim text is
-always on disk at `{TASK_JSON_PATH}`, under the `issue_text` key. If anything
-about the request looks missing to you, read that file — the answer is always
-there, and asking for it back is always wrong. If the request genuinely is
-short, that is simply how it was written: treat it as the whole request and
-implement it.
-
-If you do have to ask, ask well: one message covering everything you need, each
-question stated with what you already tried and understood, and concrete options
-("A or B?") rather than an open-ended prompt. You get exactly one reply, and it
-arrives as a brand-new task rather than a continuation of this run, so the
-question must stand on its own.
-
-To ask:
-
-- Set `status` to `"question"` in your result file and put the question text in
-  the `question` field.
-- Deliver it through the callback using the question format below, so it is
-  posted as a reply on the issue thread the request came from. It must carry
-  the `{QUESTION_TAG}` tag as documented there — that tag is how the thread and
-  the next run recognise the comment as a question rather than a result.
-- Commit and push whatever partial, coherent work you already have (if any) so
-  it is not lost, and report the branch. Do not open a PR for incomplete work
-  unless the issue text asked for one.
-
-Anything you ask that is not delivered through the callback is lost — nobody is
-watching your terminal and there is no interactive prompt. So a question left in
-your logs, or in your summary, is a question nobody will ever answer.
+The only acceptable outcome that is not finished work is an honest `"failed"`
+result explaining what blocked you — and that is for things you genuinely
+cannot do (a credential you do not have, an operation that would destroy
+data), never for something you merely find unclear.
 
 ## Callback Delivery
 
@@ -425,27 +418,10 @@ Task #<task_id>: ❌ Jiffy could not complete this task.
 **Reason:** <error_message>
 ```
 
-For a task that is blocked on a question (see "Asking a Question" above):
-
-```
-{QUESTION_TAG} Task #<task_id>: ❓ Jiffy has a question before continuing.
-
-**Question:** <question>
-
-**Branch:** <branch_name>
-
----
-
-Reply on this issue to answer — your reply starts a new Jiffy task with the
-full thread.
-```
-
 Rules:
 - If `pr_url` is null/empty, omit the **Pull Request:** line entirely.
 - If `branch_name` is null/empty, omit the **Branch:** line entirely.
 - If `technical_report` is missing or empty, omit the entire `Technical Report` section (including the `---` separator and heading) entirely.
-- In the question format, omit the **Branch:** line if you have no branch to report; keep the closing "Reply on this issue" note always.
-- The question format's leading `{QUESTION_TAG}` tag is mandatory and must be the first thing on the first line, exactly as written. It is what marks the comment as a question rather than a result; the success and failure formats must never carry it.
 - The `technical_report` field, when present, must use the following structure:
 
   ## What was done
@@ -480,8 +456,8 @@ Callback endpoint details (what the wrapper sends — for reference only):
 
 ## Required Final Output
 
-When you are finished — whether you succeeded, failed, or stopped to ask a
-question — you MUST produce a JSON file at the following path:
+When you are finished — whether you succeeded or failed — you MUST produce a
+JSON file at the following path:
 
     {AGENT_RESULT_PATH}
 
@@ -489,7 +465,7 @@ The file must contain exactly one JSON object with these fields:
 
 | Field                  | Type     | Required | Description |
 |------------------------|----------|----------|-------------|
-| `status`               | string   | yes      | `"done"` if the task was completed, `"failed"` if it was not, `"question"` if you stopped to ask the requester something. |
+| `status`               | string   | yes      | `"done"` if the task was completed, `"failed"` if it was not. |
 | `branch_name`          | string   | yes      | The branch you created or worked on. |
 | `branch_base`          | string   | yes      | The branch you created new branch from. |
 | `pr_url`               | string   | no       | URL of the PR/MR you opened, if any. |
@@ -497,7 +473,6 @@ The file must contain exactly one JSON object with these fields:
 | `summary`              | string   | yes      | A brief summary of what you did. |
 | `technical_report`     | string   | no       | Detailed technical report in markdown format for developer/technical reviewer. Must use the structure described in the Callback Delivery section above. |
 | `error_message`        | string   | no       | Details of what went wrong, if `status` is `"failed"`. |
-| `question`             | string   | yes if `status` is `"question"` | The question you need answered before you can continue. Required — a `"question"` status without it is treated as a failure. |
 | `callback`             | object   | yes      | Outcome of your callback attempt. See below. |
 
 ### The `callback` object
