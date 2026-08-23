@@ -37,7 +37,7 @@ from jobs.execution.container import (
     resolve_node_heap_mb,
     start_generic_sandbox_container,
 )
-from jobs.execution.exceptions import ContainerError
+from jobs.execution.exceptions import AgentError, ContainerError
 from jobs.models import Task
 
 
@@ -157,10 +157,11 @@ class BuildAgentInstructionsTest(TestCase):
         instructions = build_agent_instructions(self._make_payload())
         self.assertIn("code review", instructions.lower())
 
-    def test_empty_issue_text(self):
-        instructions = build_agent_instructions(self._make_payload(issue_text=""))
-        self.assertIn("/workspace", instructions)
-        self.assertIn(".jiffy_result.json", instructions)
+    def test_empty_issue_text_fails_instead_of_running_the_agent(self):
+        """An empty request produces a clear failure, not a puzzled agent."""
+        with self.assertRaises(AgentError) as ctx:
+            build_agent_instructions(self._make_payload(issue_text=""))
+        self.assertIn("issue text arrived empty", str(ctx.exception))
 
     def test_includes_callback_spec(self):
         instructions = build_agent_instructions(self._make_payload())

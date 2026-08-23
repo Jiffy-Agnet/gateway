@@ -1,4 +1,5 @@
 """Manages the lifecycle of a Docker container for a task."""
+import hashlib
 import io
 import json
 import logging
@@ -859,6 +860,7 @@ def stage_file_in_container(
     path: str,
     content: str,
     mode: int = 0o644,
+    verify: bool = True,
 ) -> None:
     """Write *content* to *path* inside *container*.
 
@@ -887,6 +889,37 @@ def stage_file_in_container(
         raise
     except Exception as exc:
         raise ContainerError(f"Failed to write {path}: {exc}") from exc
+
+    if verify:
+        _verify_staged_size(container, path, len(payload))
+
+
+def _verify_staged_size(container: Container, path: str, expected_bytes: int) -> None:
+    """Confirm the file that landed is the size we sent.
+
+    The Gateway should never have to infer from the agent's behaviour whether
+    the prompt arrived intact. Reading the size back turns a silent truncation
+    into a failed task with an accurate reason.
+    """
+    try:
+        exit_code, (out, err) = container.exec_run(
+            cmd=["stat", "-c", "%s", path], demux=True
+        )
+    except Exception as exc:
+        raise ContainerError(f"Could not verify {path} after upload: {exc}") from exc
+
+    if exit_code != 0:
+        raise ContainerError(
+            f"{path} is missing after upload: "
+            f"{(err or b'').decode(errors='replace').strip()}"
+        )
+
+    landed = (out or b"").decode(errors="replace").strip()
+    if landed != str(expected_bytes):
+        raise ContainerError(
+            f"{path} landed as {landed} bytes but {expected_bytes} were sent — "
+            "the agent would have received a truncated prompt"
+        )
 
 
 def write_instructions_file(container: Container, instructions: str) -> None:
@@ -927,35 +960,53 @@ def stage_callback_wrapper(
     )
 
 
-def build_agent_command(instructions_bytes: int, task_id: int = 0) -> str:
-    """Build the shell command that runs the agent over the staged instructions.
+# Where the argv copy of the prompt is staged. ``opencode run`` takes its
+# prompt from argv only — no stdin, no prompt-file flag — so the prompt is
+# read back out of this file by the shell at exec time. Keeping it separate
+# from INSTRUCTIONS_PATH means the file the agent is told to read always holds
+# the complete thread, even when the argv copy had to be trimmed to fit.
+INLINE_PROMPT_PATH = "/tmp/jiffy_prompt.txt"
 
-    Small instructions are substituted into the agent's argv, which is what
-    ``opencode run`` expects. Oversized ones would hit the kernel's
-    per-argument limit, so the agent is instead pointed at the staged file and
-    told to read it first — the full text still reaches the agent, just
-    through the filesystem instead of argv.
+
+def build_agent_command() -> str:
+    """The shell command that runs the agent over the staged prompt.
+
+    The prompt is substituted from a file rather than embedded in this string:
+    the command itself is an argv entry too, so inlining the text here would
+    hit the same kernel limit twice over.
     """
-    if instructions_bytes <= MAX_INLINE_INSTRUCTIONS_BYTES:
-        prompt = f'"$(cat {INSTRUCTIONS_PATH})"'
-    else:
-        logger.info(
-            "[%d] Instructions are %d bytes — handing them to the agent by "
-            "path instead of inline to stay under the argv limit",
-            task_id,
-            instructions_bytes,
-        )
-        prompt = (
-            f'"Your full task instructions are too large to pass inline and '
-            f'have been written to {INSTRUCTIONS_PATH}. Read that entire file '
-            f'first — it is the complete, verbatim task, including the required '
-            f'output contract — then carry it out exactly as written."'
-        )
-
     return (
         f"cd {WORKSPACE} && "
-        f"opencode run --auto {prompt} > /proc/1/fd/1 2>&1"
+        f'opencode run --auto "$(cat {INLINE_PROMPT_PATH})" > /proc/1/fd/1 2>&1'
     )
+
+
+def _log_prompt_delivery(full: str, inline: str, task_id: int) -> None:
+    """Record exactly what was handed to the agent.
+
+    One line that settles, after the fact, whether the agent received the whole
+    request — instead of having to infer it from what the agent then said.
+    """
+    full_bytes = len(full.encode("utf-8"))
+    inline_bytes = len(inline.encode("utf-8"))
+    digest = hashlib.sha256(full.encode("utf-8")).hexdigest()[:12]
+    if inline_bytes == full_bytes:
+        logger.info(
+            "[%d] Prompt delivered in full: %d bytes inline (sha256:%s)",
+            task_id,
+            full_bytes,
+            digest,
+        )
+    else:
+        logger.warning(
+            "[%d] Prompt too large for argv: %d bytes staged at %s, %d bytes "
+            "inline with a pointer to the full copy (sha256:%s)",
+            task_id,
+            full_bytes,
+            INSTRUCTIONS_PATH,
+            inline_bytes,
+            digest,
+        )
 
 
 def run_agent_in_container(
@@ -964,6 +1015,7 @@ def run_agent_in_container(
         task_id: int = 0,
         timeout_seconds: int | None = None,
         callback_config: Dict[str, Any] | None = None,
+        inline_instructions: str | None = None,
 ) -> None:
     """Run the coding agent inside the container with the given instructions."""
     effective_timeout = timeout_seconds or getattr(
@@ -973,14 +1025,22 @@ def run_agent_in_container(
     logger.info("[%d] Running agent in container %s (timeout=%ds, model=%s)", task_id, container.short_id,
                 effective_timeout, model)
 
+    # The staged file always holds the complete instructions; the argv copy may
+    # be a trimmed variant that still points at the file (see
+    # ``build_inline_instructions``). Both are verified after upload, so a
+    # truncated prompt fails the task here instead of surfacing later as the
+    # agent asking what the task was.
     write_instructions_file(container, instructions)
+    stage_file_in_container(container, INLINE_PROMPT_PATH, inline_instructions or instructions)
+    _log_prompt_delivery(instructions, inline_instructions or instructions, task_id)
+
     if callback_config:
         stage_callback_wrapper(container, callback_config, task_id=task_id)
 
     # Use login shell (-l) so .profile is sourced and all tools (nvm, uv, etc.) are available
     # Redirect agent stdout/stderr to the container's main stdout so docker logs
     # shows real-time output; exit code remains captured via exec_inspect.
-    run_cmd = build_agent_command(len(instructions.encode("utf-8")), task_id=task_id)
+    run_cmd = build_agent_command()
 
     # Start the agent *detached* and poll for completion instead of blocking on
     # the exec's output stream.

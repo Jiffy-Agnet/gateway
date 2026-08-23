@@ -6,13 +6,17 @@ from unittest.mock import MagicMock, patch
 
 from django.test import TestCase, override_settings
 
+from jobs.execution.agent import build_inline_instructions
 from jobs.execution.container import (
+    INLINE_PROMPT_PATH,
+    INSTRUCTIONS_PATH,
     MAX_INLINE_INSTRUCTIONS_BYTES,
     build_agent_command,
     run_agent_in_container,
     write_instructions_file,
 )
 from jobs.execution.exceptions import ContainerError
+from tests.support import sandbox_container_mock, staged_files
 
 
 class RunAgentInContainerTest(TestCase):
@@ -26,14 +30,7 @@ class RunAgentInContainerTest(TestCase):
     """
 
     def _container(self, inspect_results):
-        container = MagicMock()
-        container.short_id = "abc123"
-        # Serves both the opencode-config read and the instructions write.
-        container.exec_run.return_value = (0, (b'{"model": "test/model"}', b""))
-        api = container.client.api
-        api.exec_create.return_value = {"Id": "exec-1"}
-        api.exec_inspect.side_effect = list(inspect_results)
-        return container
+        return sandbox_container_mock(inspect_results)
 
     def test_exec_is_detached_and_polled(self):
         container = self._container([
@@ -89,7 +86,7 @@ class InstructionsStagingTest(TestCase):
     """
 
     def test_instructions_are_uploaded_not_echoed_through_a_shell(self):
-        container = MagicMock()
+        container = sandbox_container_mock()
         text = "x" * (4 * 1024 * 1024)
 
         write_instructions_file(container, text)
@@ -102,11 +99,13 @@ class InstructionsStagingTest(TestCase):
             self.assertEqual(
                 tar.extractfile(member).read().decode("utf-8"), text
             )
-        # Nothing may go through a shell: that is what imposed the old limit.
-        container.exec_run.assert_not_called()
+        # The only shell command is the size read-back; the content itself
+        # never goes through one — that is what imposed the old limit.
+        for call in container.exec_run.call_args_list:
+            self.assertEqual(call.kwargs["cmd"][0], "stat")
 
     def test_shell_metacharacters_survive_verbatim(self):
-        container = MagicMock()
+        container = sandbox_container_mock()
         text = "quotes ' \" and $(rm -rf /) and \\backslash\\ and\nnewlines"
 
         write_instructions_file(container, text)
@@ -117,37 +116,184 @@ class InstructionsStagingTest(TestCase):
         self.assertEqual(body.decode("utf-8"), text)
 
     def test_upload_rejection_raises_container_error(self):
-        container = MagicMock()
+        container = sandbox_container_mock()
+        container.put_archive.side_effect = None
         container.put_archive.return_value = False
         with self.assertRaises(ContainerError):
             write_instructions_file(container, "hello")
 
-    def test_small_instructions_are_passed_inline(self):
-        cmd = build_agent_command(1024)
-        self.assertIn('opencode run --auto "$(cat /tmp/jiffy_instructions.txt)"', cmd)
-
-    def test_oversized_instructions_are_passed_by_path(self):
-        cmd = build_agent_command(MAX_INLINE_INSTRUCTIONS_BYTES + 1)
-        self.assertNotIn("$(cat", cmd)
-        self.assertIn("/tmp/jiffy_instructions.txt", cmd)
-        # The prompt argv must stay well under the kernel's per-argument cap.
+    def test_prompt_is_read_from_a_file_not_embedded_in_the_command(self):
+        """The command is an argv entry too — inlining the text would cap it."""
+        cmd = build_agent_command()
+        self.assertIn(f'"$(cat {INLINE_PROMPT_PATH})"', cmd)
         self.assertLess(len(cmd.encode("utf-8")), 4096)
 
     def test_a_multi_megabyte_thread_still_runs(self):
         """End-to-end: a huge thread reaches the agent instead of blowing up."""
-        container = MagicMock()
-        container.short_id = "abc123"
-        container.exec_run.return_value = (0, (b'{"model": "test/model"}', b""))
-        api = container.client.api
-        api.exec_create.return_value = {"Id": "exec-1"}
-        api.exec_inspect.side_effect = [{"Running": False, "ExitCode": 0}]
+        container = sandbox_container_mock([{"Running": False, "ExitCode": 0}])
 
         instructions = "y" * (2 * 1024 * 1024)
         run_agent_in_container(container, instructions, task_id=7)
 
-        _, archive = container.put_archive.call_args.args
-        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-            staged = tar.extractfile(tar.getmember("jiffy_instructions.txt")).read()
-        self.assertEqual(len(staged), len(instructions.encode("utf-8")))
-        run_cmd = api.exec_create.call_args.kwargs["cmd"][3]
+        staged = staged_files(container)
+        self.assertEqual(
+            len(staged[INSTRUCTIONS_PATH].encode("utf-8")),
+            len(instructions.encode("utf-8")),
+        )
+        run_cmd = container.client.api.exec_create.call_args.kwargs["cmd"][3]
         self.assertLess(len(run_cmd.encode("utf-8")), 4096)
+
+
+class InlinePromptTest(TestCase):
+    """`opencode run` reads its prompt from argv only, so the argv copy has to
+    fit — but it must never be a bare pointer the agent has to act on faith."""
+
+    def _payload(self, body):
+        return {
+            "repo": {"url": "https://github.com/user/repo"},
+            "issue": {
+                "turns": [
+                    {
+                        "role": "user",
+                        "author": "a",
+                        "body": body,
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ],
+                "external_issue_id": "1",
+            },
+            "callback": {"url": "https://example.com/cb", "secret": "sec"},
+        }
+
+    def test_a_prompt_that_fits_is_used_unchanged(self):
+        from jobs.execution.agent import build_agent_instructions
+
+        payload = self._payload("Fix the deploy script")
+        full = build_agent_instructions(payload)
+        inline = build_inline_instructions(payload, full, MAX_INLINE_INSTRUCTIONS_BYTES)
+        self.assertEqual(inline, full)
+
+    def test_an_oversized_prompt_is_trimmed_to_fit(self):
+        from jobs.execution.agent import build_agent_instructions
+
+        payload = self._payload("Fix the deploy script.\n" + ("history line\n" * 20000))
+        full = build_agent_instructions(payload)
+        self.assertGreater(len(full.encode("utf-8")), MAX_INLINE_INSTRUCTIONS_BYTES)
+
+        inline = build_inline_instructions(payload, full, MAX_INLINE_INSTRUCTIONS_BYTES)
+        self.assertLessEqual(
+            len(inline.encode("utf-8")), MAX_INLINE_INSTRUCTIONS_BYTES
+        )
+
+    def test_the_trimmed_prompt_still_carries_the_start_of_the_request(self):
+        """The old bare pointer left the agent with no task at all."""
+        from jobs.execution.agent import build_agent_instructions
+
+        payload = self._payload("Fix the deploy script.\n" + ("history line\n" * 20000))
+        full = build_agent_instructions(payload)
+        inline = build_inline_instructions(payload, full, MAX_INLINE_INSTRUCTIONS_BYTES)
+        self.assertIn("Fix the deploy script.", inline)
+
+    def test_the_trimmed_prompt_keeps_the_whole_contract(self):
+        from jobs.execution.agent import build_agent_instructions
+
+        payload = self._payload("Fix it.\n" + ("history line\n" * 20000))
+        full = build_agent_instructions(payload)
+        inline = build_inline_instructions(payload, full, MAX_INLINE_INSTRUCTIONS_BYTES)
+        for section in (
+            "## Callback Delivery",
+            "## Required Final Output",
+            ".jiffy_result.json",
+            "## Asking a Question",
+        ):
+            self.assertIn(section, inline)
+
+    def test_the_trimmed_prompt_says_where_the_rest_is(self):
+        from jobs.execution.agent import build_agent_instructions
+
+        payload = self._payload("Fix it.\n" + ("history line\n" * 20000))
+        full = build_agent_instructions(payload)
+        inline = build_inline_instructions(payload, full, MAX_INLINE_INSTRUCTIONS_BYTES)
+        self.assertIn(INSTRUCTIONS_PATH, inline)
+        self.assertIn("too large to include in full here", inline)
+        self.assertIn("Do not ask anyone to re-send it", inline)
+
+    def test_the_fenced_region_is_never_empty(self):
+        """The exact symptom to prevent: markers present, nothing between them."""
+        from jobs.execution.agent import (
+            ISSUE_BEGIN_MARKER,
+            ISSUE_END_MARKER,
+            build_agent_instructions,
+        )
+
+        for body in ("short", "Fix it.\n" + ("history line\n" * 20000)):
+            payload = self._payload(body)
+            full = build_agent_instructions(payload)
+            inline = build_inline_instructions(
+                payload, full, MAX_INLINE_INSTRUCTIONS_BYTES
+            )
+            for rendered in (full, inline):
+                fenced = rendered.split(ISSUE_BEGIN_MARKER)[1].split(ISSUE_END_MARKER)[0]
+                self.assertTrue(fenced.strip(), "issue region rendered empty")
+
+    def test_both_copies_are_staged_and_the_file_holds_everything(self):
+        from jobs.execution.agent import build_agent_instructions
+
+        payload = self._payload("Fix it.\n" + ("history line\n" * 20000))
+        full = build_agent_instructions(payload)
+        inline = build_inline_instructions(payload, full, MAX_INLINE_INSTRUCTIONS_BYTES)
+
+        container = sandbox_container_mock([{"Running": False, "ExitCode": 0}])
+        run_agent_in_container(
+            container, full, task_id=1, inline_instructions=inline
+        )
+
+        staged = staged_files(container)
+        self.assertEqual(staged[INSTRUCTIONS_PATH], full)
+        self.assertEqual(staged[INLINE_PROMPT_PATH], inline)
+
+
+class StagedFileVerificationTest(TestCase):
+    """The Gateway must prove the prompt landed, not infer it from behaviour."""
+
+    def test_a_truncated_upload_fails_the_task(self):
+        container = sandbox_container_mock()
+
+        def _short_stat(cmd=None, **kwargs):
+            if cmd and cmd[0] == "stat":
+                return 0, (b"5", b"")
+            return 0, (b'{"model": "m"}', b"")
+
+        container.exec_run.side_effect = _short_stat
+
+        with self.assertRaises(ContainerError) as ctx:
+            write_instructions_file(container, "a much longer instruction text")
+        self.assertIn("truncated prompt", str(ctx.exception))
+
+    def test_a_missing_file_fails_the_task(self):
+        container = sandbox_container_mock()
+
+        def _missing(cmd=None, **kwargs):
+            if cmd and cmd[0] == "stat":
+                return 1, (b"", b"No such file or directory")
+            return 0, (b'{"model": "m"}', b"")
+
+        container.exec_run.side_effect = _missing
+
+        with self.assertRaises(ContainerError) as ctx:
+            write_instructions_file(container, "instructions")
+        self.assertIn("missing after upload", str(ctx.exception))
+
+    def test_delivery_is_logged_with_sizes(self):
+        container = sandbox_container_mock([{"Running": False, "ExitCode": 0}])
+        with self.assertLogs("jobs.execution.container", level="INFO") as cm:
+            run_agent_in_container(container, "do the thing", task_id=3)
+        self.assertIn("Prompt delivered in full", "\n".join(cm.output))
+
+    def test_a_trimmed_delivery_is_logged_as_such(self):
+        container = sandbox_container_mock([{"Running": False, "ExitCode": 0}])
+        with self.assertLogs("jobs.execution.container", level="WARNING") as cm:
+            run_agent_in_container(
+                container, "x" * 5000, task_id=3, inline_instructions="short"
+            )
+        self.assertIn("too large for argv", "\n".join(cm.output))

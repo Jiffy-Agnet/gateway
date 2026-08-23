@@ -9,6 +9,7 @@ from docker.models.containers import Container
 from apps.ingestion.callback import QUESTION_TAG
 from jobs.callback_specs import get_callback_spec
 from jobs.execution.container import CALLBACK_SCRIPT_PATH, INSTRUCTIONS_PATH
+from jobs.execution.exceptions import AgentError
 
 logger = logging.getLogger(__name__)
 
@@ -92,13 +93,54 @@ def _extract_suggested_areas(issue_text: str) -> str | None:
     return content or None
 
 
-def build_agent_instructions(payload: Dict[str, Any]) -> str:
+def _truncate_issue_text(issue_text: str, max_bytes: int) -> str:
+    """Trim *issue_text* to *max_bytes*, leaving a pointer to the full copy.
+
+    Only ever used for the argv copy of the prompt. The staged file always
+    holds the whole thread, and the notice says so, so the agent is never left
+    guessing whether it has the whole request.
+    """
+    notice = (
+        "\n\n[... This thread is too large to include in full here. "
+        f"The COMPLETE, verbatim thread — everything above plus the rest — is "
+        f"in the file {INSTRUCTIONS_PATH} inside this container. Read that file "
+        "before you act: what follows this line in the file is part of the same "
+        "request. Do not ask anyone to re-send it. ...]"
+    )
+    budget = max_bytes - len(notice.encode("utf-8"))
+    if budget <= 0:
+        return notice.strip()
+    encoded = issue_text.encode("utf-8")[:budget]
+    # Never split a multi-byte character in half.
+    return encoded.decode("utf-8", errors="ignore") + notice
+
+
+def build_agent_instructions(
+    payload: Dict[str, Any],
+    issue_text_limit: int | None = None,
+) -> str:
     """Build the instructions text handed to the coding agent.
 
     The instructions are agent-agnostic — they describe the contract without
     assuming any particular CLI conventions.
+
+    ``issue_text_limit`` caps the *issue text only*, for the copy that has to
+    fit in the agent's argv; the surrounding contract is never trimmed. Leave
+    it unset for the full text, which is what gets staged to disk.
     """
     issue_text = _extract_issue_text(payload)
+    if not issue_text.strip():
+        # An empty request is a Gateway or edge bug, and handing it to the
+        # agent only produces "what would you like me to do?" hours later.
+        # Fail here, where the reason can still be reported accurately.
+        raise AgentError(
+            "The issue text arrived empty — there is nothing for the agent to "
+            "work on. This is a Gateway/edge problem, not a problem with the "
+            "request: check that the ingestion payload carried a non-empty "
+            "'issue.turns[].body' or 'issue.text'."
+        )
+    if issue_text_limit is not None and len(issue_text.encode("utf-8")) > issue_text_limit:
+        issue_text = _truncate_issue_text(issue_text, issue_text_limit)
     suggested_areas = _extract_suggested_areas(issue_text)
     provider = payload.get("repo", {}).get("provider_hint", "github")
     callback_url = payload.get("callback", {}).get("url", "")
@@ -425,6 +467,39 @@ If you could not attempt the callback at all (e.g. network unavailable), set
 Do not skip this step. If you do not produce this file the system will treat
 your run as a failure.
 """
+
+
+def build_inline_instructions(
+    payload: Dict[str, Any],
+    full_instructions: str,
+    max_bytes: int,
+) -> str:
+    """The copy of the prompt that goes in the agent's argv.
+
+    ``opencode run`` takes its prompt from argv only — no stdin, no
+    prompt-file flag — and the kernel caps a single argv entry at
+    MAX_ARG_STRLEN. When the full prompt fits, it is used unchanged. When it
+    does not, the *issue text* is trimmed to fit while the whole contract
+    around it is preserved, and the trimmed region says where the complete
+    thread is. The agent therefore always receives a valid, self-contained
+    prompt with the start of the real request in it — never a bare pointer it
+    has to act on faith.
+    """
+    if len(full_instructions.encode("utf-8")) <= max_bytes:
+        return full_instructions
+
+    issue_text = _extract_issue_text(payload)
+    overhead = len(full_instructions.encode("utf-8")) - len(issue_text.encode("utf-8"))
+    budget = max_bytes - overhead
+    if budget <= 0:
+        # The contract alone does not fit; nothing sensible left to trim.
+        logger.error(
+            "Instruction template alone exceeds the inline budget (%d > %d bytes)",
+            overhead,
+            max_bytes,
+        )
+        budget = 1
+    return build_agent_instructions(payload, issue_text_limit=budget)
 
 
 def read_agent_result(container: Container) -> AgentResult:
