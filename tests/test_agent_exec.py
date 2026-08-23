@@ -1,19 +1,23 @@
 """Tests for how the agent process is executed inside the sandbox container."""
 
-import io
-import tarfile
+import json
 from unittest.mock import MagicMock, patch
 
 from django.test import TestCase, override_settings
 
-from jobs.execution.agent import build_inline_instructions
+from jobs.execution.agent import (
+    ISSUE_BEGIN_MARKER,
+    ISSUE_END_MARKER,
+    MAX_INLINE_ISSUE_TEXT_BYTES,
+    build_agent_instructions,
+    build_task_document,
+)
 from jobs.execution.container import (
-    INLINE_PROMPT_PATH,
-    INSTRUCTIONS_PATH,
-    MAX_INLINE_INSTRUCTIONS_BYTES,
+    PROMPT_PATH,
+    TASK_JSON_PATH,
     build_agent_command,
     run_agent_in_container,
-    write_instructions_file,
+    write_task_document,
 )
 from jobs.execution.exceptions import ContainerError
 from tests.support import sandbox_container_mock, staged_files
@@ -76,77 +80,8 @@ class RunAgentInContainerTest(TestCase):
         self.assertIn("did not finish within 120s", str(ctx.exception))
 
 
-class InstructionsStagingTest(TestCase):
-    """The instructions text must not be capped by any shell/argv limit.
-
-    An issue thread is the whole conversation — issue body plus every comment —
-    so it can be far larger than the kernel's per-argument ceiling
-    (MAX_ARG_STRLEN, 128 KiB).  Staging it through a shell command, as the
-    Gateway used to, made a large thread fail with "Argument list too long".
-    """
-
-    def test_instructions_are_uploaded_not_echoed_through_a_shell(self):
-        container = sandbox_container_mock()
-        text = "x" * (4 * 1024 * 1024)
-
-        write_instructions_file(container, text)
-
-        container.put_archive.assert_called_once()
-        path, archive = container.put_archive.call_args.args
-        self.assertEqual(path, "/tmp")
-        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-            member = tar.getmember("jiffy_instructions.txt")
-            self.assertEqual(
-                tar.extractfile(member).read().decode("utf-8"), text
-            )
-        # The only shell command is the size read-back; the content itself
-        # never goes through one — that is what imposed the old limit.
-        for call in container.exec_run.call_args_list:
-            self.assertEqual(call.kwargs["cmd"][0], "stat")
-
-    def test_shell_metacharacters_survive_verbatim(self):
-        container = sandbox_container_mock()
-        text = "quotes ' \" and $(rm -rf /) and \\backslash\\ and\nnewlines"
-
-        write_instructions_file(container, text)
-
-        _, archive = container.put_archive.call_args.args
-        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-            body = tar.extractfile(tar.getmember("jiffy_instructions.txt")).read()
-        self.assertEqual(body.decode("utf-8"), text)
-
-    def test_upload_rejection_raises_container_error(self):
-        container = sandbox_container_mock()
-        container.put_archive.side_effect = None
-        container.put_archive.return_value = False
-        with self.assertRaises(ContainerError):
-            write_instructions_file(container, "hello")
-
-    def test_prompt_is_read_from_a_file_not_embedded_in_the_command(self):
-        """The command is an argv entry too — inlining the text would cap it."""
-        cmd = build_agent_command()
-        self.assertIn(f'"$(cat {INLINE_PROMPT_PATH})"', cmd)
-        self.assertLess(len(cmd.encode("utf-8")), 4096)
-
-    def test_a_multi_megabyte_thread_still_runs(self):
-        """End-to-end: a huge thread reaches the agent instead of blowing up."""
-        container = sandbox_container_mock([{"Running": False, "ExitCode": 0}])
-
-        instructions = "y" * (2 * 1024 * 1024)
-        run_agent_in_container(container, instructions, task_id=7)
-
-        staged = staged_files(container)
-        self.assertEqual(
-            len(staged[INSTRUCTIONS_PATH].encode("utf-8")),
-            len(instructions.encode("utf-8")),
-        )
-        run_cmd = container.client.api.exec_create.call_args.kwargs["cmd"][3]
-        self.assertLess(len(run_cmd.encode("utf-8")), 4096)
-
-
-class InlinePromptTest(TestCase):
-    """`opencode run` reads its prompt from argv only, so the argv copy has to
-    fit — but it must never be a bare pointer the agent has to act on faith."""
+class TaskStagingTest(TestCase):
+    """The task travels by file, so nothing about it depends on argv size."""
 
     def _payload(self, body):
         return {
@@ -160,101 +95,134 @@ class InlinePromptTest(TestCase):
                         "created_at": "2026-01-01T00:00:00Z",
                     }
                 ],
-                "external_issue_id": "1",
+                "external_issue_id": "42",
             },
             "callback": {"url": "https://example.com/cb", "secret": "sec"},
         }
 
-    def test_a_prompt_that_fits_is_used_unchanged(self):
-        from jobs.execution.agent import build_agent_instructions
-
-        payload = self._payload("Fix the deploy script")
-        full = build_agent_instructions(payload)
-        inline = build_inline_instructions(payload, full, MAX_INLINE_INSTRUCTIONS_BYTES)
-        self.assertEqual(inline, full)
-
-    def test_an_oversized_prompt_is_trimmed_to_fit(self):
-        from jobs.execution.agent import build_agent_instructions
-
-        payload = self._payload("Fix the deploy script.\n" + ("history line\n" * 20000))
-        full = build_agent_instructions(payload)
-        self.assertGreater(len(full.encode("utf-8")), MAX_INLINE_INSTRUCTIONS_BYTES)
-
-        inline = build_inline_instructions(payload, full, MAX_INLINE_INSTRUCTIONS_BYTES)
-        self.assertLessEqual(
-            len(inline.encode("utf-8")), MAX_INLINE_INSTRUCTIONS_BYTES
-        )
-
-    def test_the_trimmed_prompt_still_carries_the_start_of_the_request(self):
-        """The old bare pointer left the agent with no task at all."""
-        from jobs.execution.agent import build_agent_instructions
-
-        payload = self._payload("Fix the deploy script.\n" + ("history line\n" * 20000))
-        full = build_agent_instructions(payload)
-        inline = build_inline_instructions(payload, full, MAX_INLINE_INSTRUCTIONS_BYTES)
-        self.assertIn("Fix the deploy script.", inline)
-
-    def test_the_trimmed_prompt_keeps_the_whole_contract(self):
-        from jobs.execution.agent import build_agent_instructions
-
-        payload = self._payload("Fix it.\n" + ("history line\n" * 20000))
-        full = build_agent_instructions(payload)
-        inline = build_inline_instructions(payload, full, MAX_INLINE_INSTRUCTIONS_BYTES)
-        for section in (
-            "## Callback Delivery",
-            "## Required Final Output",
-            ".jiffy_result.json",
-            "## Asking a Question",
-        ):
-            self.assertIn(section, inline)
-
-    def test_the_trimmed_prompt_says_where_the_rest_is(self):
-        from jobs.execution.agent import build_agent_instructions
-
-        payload = self._payload("Fix it.\n" + ("history line\n" * 20000))
-        full = build_agent_instructions(payload)
-        inline = build_inline_instructions(payload, full, MAX_INLINE_INSTRUCTIONS_BYTES)
-        self.assertIn(INSTRUCTIONS_PATH, inline)
-        self.assertIn("too large to include in full here", inline)
-        self.assertIn("Do not ask anyone to re-send it", inline)
-
-    def test_the_fenced_region_is_never_empty(self):
-        """The exact symptom to prevent: markers present, nothing between them."""
-        from jobs.execution.agent import (
-            ISSUE_BEGIN_MARKER,
-            ISSUE_END_MARKER,
-            build_agent_instructions,
-        )
-
-        for body in ("short", "Fix it.\n" + ("history line\n" * 20000)):
-            payload = self._payload(body)
-            full = build_agent_instructions(payload)
-            inline = build_inline_instructions(
-                payload, full, MAX_INLINE_INSTRUCTIONS_BYTES
-            )
-            for rendered in (full, inline):
-                fenced = rendered.split(ISSUE_BEGIN_MARKER)[1].split(ISSUE_END_MARKER)[0]
-                self.assertTrue(fenced.strip(), "issue region rendered empty")
-
-    def test_both_copies_are_staged_and_the_file_holds_everything(self):
-        from jobs.execution.agent import build_agent_instructions
-
-        payload = self._payload("Fix it.\n" + ("history line\n" * 20000))
-        full = build_agent_instructions(payload)
-        inline = build_inline_instructions(payload, full, MAX_INLINE_INSTRUCTIONS_BYTES)
-
+    def _run(self, body):
+        payload = self._payload(body)
         container = sandbox_container_mock([{"Running": False, "ExitCode": 0}])
         run_agent_in_container(
-            container, full, task_id=1, inline_instructions=inline
+            container,
+            build_agent_instructions(payload),
+            task_id=1,
+            task_document=build_task_document(payload, task_id=1),
+        )
+        return container, staged_files(container)
+
+    def test_task_json_carries_the_whole_thread(self):
+        body = "Fix the deploy script.\n" + ("history line\n" * 20000)
+        _, staged = self._run(body)
+        document = json.loads(staged[TASK_JSON_PATH])
+        self.assertIn(body, document["issue_text"])
+        self.assertEqual(
+            document["issue_text_bytes"], len(document["issue_text"].encode("utf-8"))
         )
 
-        staged = staged_files(container)
-        self.assertEqual(staged[INSTRUCTIONS_PATH], full)
-        self.assertEqual(staged[INLINE_PROMPT_PATH], inline)
+    def test_task_json_is_written_as_a_tar_upload_not_through_a_shell(self):
+        container = sandbox_container_mock()
+        write_task_document(container, {"issue_text": "x' \" $(rm -rf /)"})
+        container.put_archive.assert_called_once()
+        for call in container.exec_run.call_args_list:
+            self.assertEqual(call.kwargs["cmd"][0], "stat")
+
+    def test_task_json_carries_no_credentials(self):
+        payload = self._payload("do it")
+        payload["repo"]["token"] = "ghp_secret"
+        document = build_task_document(payload, task_id=1)
+        self.assertNotIn("ghp_secret", json.dumps(document))
+        self.assertNotIn("sec", json.dumps(document.get("callback", {})))
+
+    def test_prompt_size_does_not_grow_with_the_thread(self):
+        """A huge thread must not push the prompt anywhere near the argv cap."""
+        _, small = self._run("short request")
+        _, huge = self._run("Fix it.\n" + ("history line\n" * 40000))
+        self.assertLess(len(huge[PROMPT_PATH].encode("utf-8")), 64 * 1024)
+        self.assertLess(
+            abs(len(huge[PROMPT_PATH]) - len(small[PROMPT_PATH])),
+            MAX_INLINE_ISSUE_TEXT_BYTES,
+        )
+
+    def test_the_command_stays_tiny_whatever_the_thread(self):
+        cmd = build_agent_command()
+        self.assertIn(f'"$(cat {PROMPT_PATH})"', cmd)
+        self.assertLess(len(cmd.encode("utf-8")), 4096)
+
+
+class IssueSectionTest(TestCase):
+    """The prompt must never look truncated to the agent.
+
+    The reported failure was the agent answering "the message appears to be cut
+    off" and asking for the task to be re-sent, because the fenced region was
+    empty or the prompt was a bare pointer.
+    """
+
+    def _instructions(self, body):
+        return build_agent_instructions({
+            "repo": {"url": "https://github.com/user/repo"},
+            "issue": {
+                "turns": [
+                    {
+                        "role": "user",
+                        "author": "a",
+                        "body": body,
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ],
+                "external_issue_id": "42",
+            },
+            "callback": {"url": "https://example.com/cb", "secret": "sec"},
+        })
+
+    def test_a_small_request_is_inlined_between_markers(self):
+        instructions = self._instructions("Fix the deploy script")
+        fenced = instructions.split(ISSUE_BEGIN_MARKER)[1].split(ISSUE_END_MARKER)[0]
+        self.assertIn("Fix the deploy script", fenced)
+
+    def test_a_large_request_renders_no_markers_at_all(self):
+        """Empty markers are what made the agent report a cut-off message."""
+        instructions = self._instructions("Fix it.\n" + ("history line\n" * 20000))
+        self.assertNotIn(ISSUE_BEGIN_MARKER, instructions)
+        self.assertNotIn(ISSUE_END_MARKER, instructions)
+
+    def test_a_large_request_says_where_the_text_is_and_how_to_read_it(self):
+        instructions = self._instructions("Fix it.\n" + ("history line\n" * 20000))
+        self.assertIn("The task text is not in this message", instructions)
+        self.assertIn(TASK_JSON_PATH, instructions)
+        self.assertIn("issue_text", instructions)
+        self.assertIn("Before you do anything else, read it", instructions)
+
+    def test_every_size_points_at_the_task_file(self):
+        for body in ("tiny", "Fix it.\n" + ("history line\n" * 20000)):
+            self.assertIn(TASK_JSON_PATH, self._instructions(body))
+
+    def test_no_size_ever_tells_the_agent_to_ask_for_the_text(self):
+        """Both renderings must forbid the one useless question."""
+        for body in ("tiny", "Fix it.\n" + ("history line\n" * 20000)):
+            collapsed = " ".join(self._instructions(body).split())
+            self.assertIn("never ask the requester to re-send", collapsed)
+            self.assertIn(
+                "Do not ask anyone to provide, repeat or complete the task text",
+                collapsed,
+            ) if len(body) > 1000 else self.assertIn(
+                "Never ask anyone to re-send or complete it", collapsed
+            )
+
+    def test_the_contract_survives_at_every_size(self):
+        for body in ("tiny", "Fix it.\n" + ("history line\n" * 20000)):
+            instructions = self._instructions(body)
+            for section in (
+                "## Callback Delivery",
+                "## Required Final Output",
+                ".jiffy_result.json",
+                "## Asking a Question",
+            ):
+                self.assertIn(section, instructions)
 
 
 class StagedFileVerificationTest(TestCase):
-    """The Gateway must prove the prompt landed, not infer it from behaviour."""
+    """The Gateway must prove what landed, not infer it from behaviour."""
 
     def test_a_truncated_upload_fails_the_task(self):
         container = sandbox_container_mock()
@@ -267,7 +235,7 @@ class StagedFileVerificationTest(TestCase):
         container.exec_run.side_effect = _short_stat
 
         with self.assertRaises(ContainerError) as ctx:
-            write_instructions_file(container, "a much longer instruction text")
+            write_task_document(container, {"issue_text": "a much longer text"})
         self.assertIn("truncated prompt", str(ctx.exception))
 
     def test_a_missing_file_fails_the_task(self):
@@ -281,19 +249,90 @@ class StagedFileVerificationTest(TestCase):
         container.exec_run.side_effect = _missing
 
         with self.assertRaises(ContainerError) as ctx:
-            write_instructions_file(container, "instructions")
+            write_task_document(container, {"issue_text": "text"})
         self.assertIn("missing after upload", str(ctx.exception))
 
-    def test_delivery_is_logged_with_sizes(self):
+    def test_handoff_is_logged_with_sizes_and_a_hash(self):
         container = sandbox_container_mock([{"Running": False, "ExitCode": 0}])
         with self.assertLogs("jobs.execution.container", level="INFO") as cm:
-            run_agent_in_container(container, "do the thing", task_id=3)
-        self.assertIn("Prompt delivered in full", "\n".join(cm.output))
-
-    def test_a_trimmed_delivery_is_logged_as_such(self):
-        container = sandbox_container_mock([{"Running": False, "ExitCode": 0}])
-        with self.assertLogs("jobs.execution.container", level="WARNING") as cm:
             run_agent_in_container(
-                container, "x" * 5000, task_id=3, inline_instructions="short"
+                container,
+                "the prompt",
+                task_id=3,
+                task_document={"issue_text": "the request", "issue_text_inlined": True},
             )
-        self.assertIn("too large for argv", "\n".join(cm.output))
+        message = "\n".join(cm.output)
+        self.assertIn("Task handed off", message)
+        self.assertIn("sha256:", message)
+        self.assertIn("inlined", message)
+
+    def test_a_by_reference_handoff_is_logged_as_such(self):
+        container = sandbox_container_mock([{"Running": False, "ExitCode": 0}])
+        with self.assertLogs("jobs.execution.container", level="INFO") as cm:
+            run_agent_in_container(
+                container,
+                "the prompt",
+                task_id=3,
+                task_document={"issue_text": "x" * 100, "issue_text_inlined": False},
+            )
+        self.assertIn("by reference", "\n".join(cm.output))
+
+
+class MissingResultDiagnosticsTest(TestCase):
+    """A run that ends with no result file must leave a trace of why."""
+
+    def _container_without_result(self, log_output=b"The message appears to be cut off."):
+        container = sandbox_container_mock()
+        container.exec_run.side_effect = lambda cmd=None, **kw: (1, (b"", b"No such file"))
+        container.logs.return_value = log_output
+        return container
+
+    def test_agent_output_is_kept_when_the_contract_is_missing(self):
+        from jobs.execution.agent import read_agent_result
+
+        container = self._container_without_result()
+        with self.assertLogs("jobs.execution.agent", level="WARNING") as cm:
+            result = read_agent_result(container)
+
+        self.assertEqual(result.status, "failed")
+        message = "\n".join(cm.output)
+        self.assertIn("ended without a result file", message)
+        self.assertIn("The message appears to be cut off.", message)
+
+    def test_a_silent_run_is_reported_as_silent(self):
+        from jobs.execution.agent import read_agent_result
+
+        container = self._container_without_result(log_output=b"   ")
+        with self.assertLogs("jobs.execution.agent", level="WARNING") as cm:
+            read_agent_result(container)
+        self.assertIn("no output at all", "\n".join(cm.output))
+
+    def test_unreadable_logs_never_mask_the_real_failure(self):
+        from jobs.execution.agent import read_agent_result
+
+        container = self._container_without_result()
+        container.logs.side_effect = RuntimeError("docker gone")
+        with self.assertLogs("jobs.execution.agent", level="WARNING"):
+            result = read_agent_result(container)
+        self.assertEqual(result.status, "failed")
+        self.assertIn("did not produce the required output contract", result.error_message)
+
+
+class ResultContractProminenceTest(TestCase):
+    """The result file must be impossible to miss, not a footnote."""
+
+    def _instructions(self):
+        return build_agent_instructions({
+            "repo": {"url": "https://github.com/user/repo"},
+            "issue": {"text": "Do the thing", "external_issue_id": "1"},
+            "callback": {"url": "https://example.com/cb", "secret": "sec"},
+        })
+
+    def test_the_result_file_is_a_numbered_step(self):
+        instructions = self._instructions()
+        self.assertIn("9. **Write the result file**", instructions)
+
+    def test_the_agent_is_told_chat_output_reaches_nobody(self):
+        collapsed = " ".join(self._instructions().split())
+        self.assertIn("Nobody is reading your chat output", collapsed)
+        self.assertIn("Answering in chat instead of doing those is the same as doing nothing", collapsed)
