@@ -973,10 +973,58 @@ def build_agent_command() -> str:
     The prompt is substituted from a file rather than embedded in this string:
     the command itself is an argv entry too, so inlining the text here would
     hit the same kernel limit twice over.
+
+    The size of what the shell actually resolved is echoed to the container log
+    first. That one line is the difference between knowing the agent was handed
+    the task and inferring it from whatever the agent then said.
     """
     return (
         f"cd {WORKSPACE} && "
-        f'opencode run --auto "$(cat {PROMPT_PATH})" > /proc/1/fd/1 2>&1'
+        f'JIFFY_PROMPT="$(cat {PROMPT_PATH})" && '
+        'echo "[jiffy] handing ${#JIFFY_PROMPT} chars of prompt to opencode" '
+        "> /proc/1/fd/1 && "
+        'opencode run --auto "$JIFFY_PROMPT" > /proc/1/fd/1 2>&1'
+    )
+
+
+def verify_prompt_reaches_argv(container: Container, prompt: str, task_id: int = 0) -> None:
+    """Check the prompt survives the exact path it takes to the agent.
+
+    Staging is verified by size, but that only proves the file landed. What
+    actually reaches ``opencode`` is the result of a command substitution in a
+    login shell, and nothing so far has ever confirmed *that* carries the whole
+    prompt. Run it here, before the agent, and fail the task if it does not:
+    an agent handed an empty prompt answers "what would you like me to work
+    on?", which is indistinguishable from a dozen other faults after the fact.
+    """
+    # Command substitution strips trailing newlines, so that is what the agent
+    # receives and what this compares against.
+    expected = len(prompt.rstrip("\n").encode("utf-8"))
+    try:
+        exit_code, (out, err) = container.exec_run(
+            cmd=["bash", "-l", "-c", f'printf %s "$(cat {PROMPT_PATH})" | wc -c'],
+            demux=True,
+        )
+    except Exception as exc:
+        raise ContainerError(f"Could not verify prompt delivery: {exc}") from exc
+
+    if exit_code != 0:
+        raise ContainerError(
+            "The shell could not read the staged prompt: "
+            f"{(err or b'').decode(errors='replace').strip()}"
+        )
+
+    delivered = (out or b"").decode(errors="replace").strip()
+    if delivered != str(expected):
+        raise ContainerError(
+            f"The prompt does not survive delivery to the agent: {expected} bytes "
+            f"staged at {PROMPT_PATH} but the shell resolves {delivered}. The "
+            "agent would have been handed an incomplete or empty task."
+        )
+    logger.info(
+        "[%d] Prompt delivery verified: %d bytes reach the agent's argv",
+        task_id,
+        expected,
     )
 
 
@@ -1028,6 +1076,7 @@ def run_agent_in_container(
     if task_document is not None:
         write_task_document(container, task_document)
     stage_file_in_container(container, PROMPT_PATH, instructions)
+    verify_prompt_reaches_argv(container, instructions, task_id=task_id)
     _log_prompt_delivery(task_document, instructions, task_id)
 
     if callback_config:

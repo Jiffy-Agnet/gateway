@@ -254,26 +254,29 @@ def build_agent_instructions(payload: Dict[str, Any]) -> str:
     issue_section = _issue_section(issue_text, suggested_areas)
 
     return f"""\
-You are a coding agent working in an isolated sandbox environment.
+# YOUR TASK — START WORKING ON THIS NOW
+
+You are a coding agent. The repository is already cloned at `{WORKSPACE}` and
+this is the request you must implement. Do not reply asking what to work on:
+the request is right here, and there is no one to answer you. Read it, then
+start.
+
+{issue_section}
+# HOW TO CARRY IT OUT
+
+Everything below is the standing procedure for the request above. Implement
+exactly what the request asks for — do not summarize or pre-parse it, and do
+not stop to check anything with anyone.
 
 Nobody is reading your chat output. Nothing you say in a reply reaches the
 person who asked: the only two things that leave this container are the file
 you write at `{AGENT_RESULT_PATH}` and the comment the callback wrapper posts.
 Answering in chat instead of doing those is the same as doing nothing.
 
-## Issue / Request
-
-Do not summarize or pre-parse the request — implement exactly what it asks for.
-
-{issue_section}
-
 ## Working Directory
 
-The target repository has already been cloned into:
-
-    /workspace
-
-and is already checked out on the `develop` branch. This is done for you —
+The repository is cloned at `/workspace` and is already checked out on the
+`develop` branch. This is done for you —
 under no circumstances should you run `git clone` again; the clone already
 exists and re-cloning wastes time and can conflict with the existing working
 tree. If you need to switch to a different branch or refresh the current one,

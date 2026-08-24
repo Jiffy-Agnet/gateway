@@ -15,6 +15,7 @@ def sandbox_container_mock(exec_results=None, model="test/model"):
     container = MagicMock()
     container.short_id = "abc123"
     staged_sizes = {}
+    staged_content = {}
 
     def _put_archive(directory, archive):
         import io
@@ -22,7 +23,9 @@ def sandbox_container_mock(exec_results=None, model="test/model"):
 
         with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
             for member in tar.getmembers():
-                staged_sizes[f"{directory.rstrip('/')}/{member.name}"] = member.size
+                path = f"{directory.rstrip('/')}/{member.name}"
+                staged_sizes[path] = member.size
+                staged_content[path] = tar.extractfile(member).read().decode("utf-8")
         return True
 
     def _exec_run(cmd=None, **kwargs):
@@ -31,6 +34,17 @@ def sandbox_container_mock(exec_results=None, model="test/model"):
             if path not in staged_sizes:
                 return 1, (b"", b"No such file or directory")
             return 0, (str(staged_sizes[path]).encode(), b"")
+        script = cmd[-1] if cmd else ""
+        if "wc -c" in script:
+            # The prompt-delivery check: a command substitution strips trailing
+            # newlines, so mirror that rather than reporting the file size.
+            for path, content in staged_content.items():
+                if path in script:
+                    return 0, (
+                        str(len(content.rstrip("\n").encode("utf-8"))).encode(),
+                        b"",
+                    )
+            return 1, (b"", b"No such file or directory")
         return 0, (json.dumps({"model": model}).encode(), b"")
 
     container.put_archive.side_effect = _put_archive
@@ -42,6 +56,7 @@ def sandbox_container_mock(exec_results=None, model="test/model"):
         api.exec_inspect.side_effect = list(exec_results)
 
     container.staged_sizes = staged_sizes
+    container.staged_content = staged_content
     return container
 
 

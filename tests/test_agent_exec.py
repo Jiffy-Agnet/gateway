@@ -338,3 +338,94 @@ class ResultContractProminenceTest(TestCase):
         collapsed = " ".join(self._instructions().split())
         self.assertIn("Nobody is reading your chat output", collapsed)
         self.assertIn("Answering in chat instead of doing those is the same as doing nothing", collapsed)
+
+
+class PromptDeliveryVerificationTest(TestCase):
+    """Staging proves the file landed; this proves the agent gets it.
+
+    What reaches `opencode` is a command substitution in a login shell, not the
+    file. Nothing used to confirm that step, so an empty prompt surfaced only
+    as the agent answering "what would you like me to work on?" — the same
+    symptom as a dozen unrelated faults.
+    """
+
+    def _container(self, delivered_bytes=None):
+        container = sandbox_container_mock([{"Running": False, "ExitCode": 0}])
+        if delivered_bytes is not None:
+            inner = container.exec_run.side_effect
+
+            def _exec_run(cmd=None, **kwargs):
+                if cmd and "wc -c" in cmd[-1]:
+                    return 0, (str(delivered_bytes).encode(), b"")
+                return inner(cmd=cmd, **kwargs)
+
+            container.exec_run.side_effect = _exec_run
+        return container
+
+    def test_a_prompt_that_survives_delivery_is_accepted(self):
+        container = self._container()
+        with self.assertLogs("jobs.execution.container", level="INFO") as cm:
+            run_agent_in_container(container, "the whole prompt", task_id=1)
+        self.assertIn("Prompt delivery verified", "\n".join(cm.output))
+
+    def test_an_empty_delivery_fails_the_task(self):
+        """The exact fault behind "what would you like me to work on?"."""
+        container = self._container(delivered_bytes=0)
+        with self.assertRaises(ContainerError) as ctx:
+            run_agent_in_container(container, "the whole prompt", task_id=1)
+        self.assertIn("does not survive delivery", str(ctx.exception))
+
+    def test_a_partial_delivery_fails_the_task(self):
+        container = self._container(delivered_bytes=5)
+        with self.assertRaises(ContainerError) as ctx:
+            run_agent_in_container(container, "the whole prompt", task_id=1)
+        self.assertIn("incomplete or empty task", str(ctx.exception))
+
+    def test_the_agent_never_starts_on_a_broken_delivery(self):
+        container = self._container(delivered_bytes=0)
+        with self.assertRaises(ContainerError):
+            run_agent_in_container(container, "the whole prompt", task_id=1)
+        container.client.api.exec_create.assert_not_called()
+
+    def test_trailing_newlines_are_not_counted_as_loss(self):
+        """Command substitution strips them, so the check must expect that."""
+        container = sandbox_container_mock([{"Running": False, "ExitCode": 0}])
+        run_agent_in_container(container, "prompt text\n\n\n", task_id=1)
+        container.client.api.exec_create.assert_called_once()
+
+    def test_the_command_logs_what_it_hands_over(self):
+        cmd = build_agent_command()
+        self.assertIn("chars of prompt to opencode", cmd)
+        self.assertIn('opencode run --auto "$JIFFY_PROMPT"', cmd)
+
+
+class PromptShapeTest(TestCase):
+    """A small model must meet the task before any boilerplate."""
+
+    def _instructions(self):
+        return build_agent_instructions({
+            "repo": {"url": "https://github.com/user/repo"},
+            "issue": {"text": "Add a health-check tool", "external_issue_id": "1"},
+            "callback": {"url": "https://example.com/cb", "secret": "sec"},
+        })
+
+    def test_the_task_is_the_first_thing_in_the_prompt(self):
+        instructions = self._instructions()
+        self.assertTrue(instructions.startswith("# YOUR TASK"))
+
+    def test_the_request_comes_before_the_procedure(self):
+        instructions = self._instructions()
+        self.assertLess(
+            instructions.index(ISSUE_END_MARKER),
+            instructions.index("# HOW TO CARRY IT OUT"),
+        )
+
+    def test_the_request_appears_within_the_first_lines(self):
+        """Not buried under a wall of preamble."""
+        instructions = self._instructions()
+        head = "\n".join(instructions.splitlines()[:12])
+        self.assertIn(ISSUE_BEGIN_MARKER, head)
+
+    def test_the_header_forbids_asking_what_to_work_on(self):
+        collapsed = " ".join(self._instructions().split())
+        self.assertIn("Do not reply asking what to work on", collapsed)
