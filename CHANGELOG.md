@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.3.0-rc.6 (2026-08-24)
+
+### Bug Fixes
+
+- **agent**: Verify prompt delivery and lead the prompt with the task
+  ([`e3ccb43`](https://github.com/Jiffy-Agnet/gateway/commit/e3ccb4372878d875040523d70ed6b0622869694a))
+
+
 ## v0.3.0-rc.5 (2026-08-23)
 
 ### Bug Fixes
