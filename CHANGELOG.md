@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.3.0-rc.7 (2026-09-22)
+
+### Bug Fixes
+
+- **agent**: Deliver the prompt over stdin and split out the system prompt
+  ([`28eb5f1`](https://github.com/Jiffy-Agnet/gateway/commit/28eb5f14eb21d84111c6ca2514584fa68ed3fbcf))
+
+
 ## v0.3.0-rc.6 (2026-08-24)
 
 ### Bug Fixes
