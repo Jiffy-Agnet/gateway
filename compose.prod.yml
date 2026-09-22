@@ -82,7 +82,7 @@ services:
       SANDBOX_NETWORK_ALLOWLIST_EXTRA: ${SANDBOX_NETWORK_ALLOWLIST_EXTRA:-}
       # Sandbox resource limits — applied by the worker to each sandbox
       # container it creates through the docker-socket-proxy.
-      SANDBOX_IMAGE: ${SANDBOX_IMAGE:-jiffy-sandbox:1.2.0}
+      SANDBOX_IMAGE: ${SANDBOX_IMAGE:-jiffy-sandbox:1.3.0}
       SANDBOX_MEMORY_LIMIT: ${SANDBOX_MEMORY_LIMIT:-2g}
       SANDBOX_MEMORY_SWAP_LIMIT: ${SANDBOX_MEMORY_SWAP_LIMIT:-4g}
       SANDBOX_CPU_LIMIT: ${SANDBOX_CPU_LIMIT:-1.5}

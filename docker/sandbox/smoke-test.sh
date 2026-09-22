@@ -5,8 +5,8 @@
 # and the OpenCode agent CLI are installed and functional.
 #
 # Usage:
-  #   docker build -t jiffy-sandbox:1.2.0 .
-#   docker run --rm jiffy-sandbox:1.2.0 bash /smoke-test.sh
+  #   docker build -t jiffy-sandbox:1.3.0 .
+#   docker run --rm jiffy-sandbox:1.3.0 bash /smoke-test.sh
 set -euo pipefail
 
 PASS=0

@@ -12,7 +12,7 @@
 # is applied at container start by the Gateway using iptables inside the
 # container's own network namespace; see docker/sandbox/README.md.
 #
-# Build: docker build -t jiffy-sandbox:1.2.0 .
+# Build: docker build -t jiffy-sandbox:1.3.0 .
 # The image tag used at runtime is read from SANDBOX_IMAGE env var.
 
 FROM debian:bookworm-20260713
@@ -128,11 +128,18 @@ RUN curl -fsSL "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/do
 #    | tar xz -C /usr/local/bin "tea"
 
 # 4. Coding agent CLI: OpenCode
-#    Installed via official install script, pinned to specific version.
 #    Runs in non-interactive mode from /workspace.
 #    OpenCode auto-discovers AGENTS.md (or falls back to CLAUDE.md) from CWD.
 #    OPENCODE_DISABLE_CLAUDE_CODE is intentionally NOT set so the fallback works.
-RUN curl -fsSL https://opencode.ai/install | bash
+#
+#    The version is pinned. Unpinned, every rebuild silently adopts whatever
+#    is current, so the agent's runtime changes without a commit — 1.18.31
+#    started rejecting OpenCode Zen's free models with a 403 FreeTierError
+#    that reaches the Gateway only as an opaque "UnknownError", while 1.18.30
+#    serves them fine. Bump this deliberately, and bump the image tag with it
+#    so ensure_sandbox_image() actually rebuilds.
+ARG OPENCODE_VERSION=1.18.30
+RUN curl -fsSL https://opencode.ai/install | bash -s -- --version "${OPENCODE_VERSION}"
 
 # Find where opencode was installed and copy to /usr/local/bin
 # Install script adds to PATH in .bashrc, so we source it and use which

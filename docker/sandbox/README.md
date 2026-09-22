@@ -8,9 +8,9 @@ runtime.
 
 ```bash
 # Build
-./build.sh                            # tags jiffy-sandbox:1.2.0
+./build.sh                            # tags jiffy-sandbox:1.3.0
 # Or with a registry target:
-./build.sh ghcr.io/org/jiffy-sandbox:1.2.0
+./build.sh ghcr.io/org/jiffy-sandbox:1.3.0
 ```
 
 ## Network Egress Restriction
@@ -95,6 +95,6 @@ effective allow-list used. This appears both in the Gateway worker log
 ## Smoke test
 
 ```bash
-docker build -t jiffy-sandbox:1.2.0 .
-docker run --rm jiffy-sandbox:1.2.0 bash /smoke-test.sh
+docker build -t jiffy-sandbox:1.3.0 .
+docker run --rm jiffy-sandbox:1.3.0 bash /smoke-test.sh
 ```

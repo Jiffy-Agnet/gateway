@@ -225,6 +225,12 @@ _default_network_allowlist = ",".join([
     "codeload.github.com",
     "gitlab.com",
     "gitea.com",
+    # The agent's own LLM endpoint: the shipped opencode.json selects an
+    # `opencode/<model>`, i.e. OpenCode Zen at https://opencode.ai/zen/v1.
+    # Leaving it out makes the default config unusable the moment egress
+    # restriction is on.  A non-Zen endpoint still goes in
+    # SANDBOX_NETWORK_ALLOWLIST_EXTRA.
+    "opencode.ai",
 ])
 # Full override of the default allow-list.  Unset to use the defaults above.
 SANDBOX_NETWORK_ALLOWLIST = [
