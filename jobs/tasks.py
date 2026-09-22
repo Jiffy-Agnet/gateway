@@ -13,6 +13,7 @@ from jobs.callback_specs import build_sandbox_callback_config, get_callback_spec
 from jobs.execution.agent import (
     AgentResult,
     build_agent_instructions,
+    build_system_prompt,
     build_task_document,
     read_agent_result,
 )
@@ -361,6 +362,7 @@ def execute_task(self, task_id: int) -> None:
             # Running — agent does everything from here
             _update_status(task, "running")
             instructions = build_agent_instructions(payload)
+            system_prompt = build_system_prompt(payload)
             task_document = build_task_document(payload, task_id=task_id)
             try:
                 callback_config = build_sandbox_callback_config(
@@ -391,6 +393,7 @@ def execute_task(self, task_id: int) -> None:
                 task_id=task_id,
                 callback_config=callback_config,
                 task_document=task_document,
+                system_prompt=system_prompt,
             )
 
             # Read result

@@ -1,4 +1,20 @@
-"""Handles agent instructions and result parsing."""
+"""Handles agent instructions and result parsing.
+
+The prompt is split in two:
+
+- :func:`build_agent_instructions` builds the **user prompt**: the request for
+  this run, verbatim, plus task-specific pointers. It is staged at
+  ``PROMPT_PATH`` and piped into the agent's stdin, so its size is bounded by
+  the container filesystem, not by the 128 KiB kernel cap on a single argv
+  entry.
+- :func:`build_system_prompt` builds the **system prompt**: the standing
+  contract every run shares (working directory, resource limits, the no-
+  questions rule, callback delivery, the result file). It is staged at
+  ``SYSTEM_PROMPT_PATH`` and referenced from the OpenCode ``instructions``
+  config, so it is loaded by the agent before it reads the request.
+
+Neither prompt travels through the agent's argv.
+"""
 import hashlib
 import json
 import logging
@@ -8,7 +24,12 @@ from typing import Any, Dict, NamedTuple
 from docker.models.containers import Container
 
 from jobs.callback_specs import get_callback_spec
-from jobs.execution.container import CALLBACK_SCRIPT_PATH, TASK_JSON_PATH, WORKSPACE
+from jobs.execution.container import (
+    CALLBACK_SCRIPT_PATH,
+    SYSTEM_PROMPT_PATH,
+    TASK_JSON_PATH,
+    WORKSPACE,
+)
 from jobs.execution.exceptions import AgentError
 
 logger = logging.getLogger(__name__)
@@ -93,15 +114,11 @@ def _extract_suggested_areas(issue_text: str) -> str | None:
     return content or None
 
 
-# How much issue text is reproduced inside the prompt itself. ``opencode run``
-# takes its prompt from argv only and the kernel caps a single argv entry at
-# 128 KiB (MAX_ARG_STRLEN); the surrounding contract is ~15 KiB, so this leaves
-# a wide margin. The request is ALWAYS inlined up to this size — a model handed
-# a pointer to a file instead of a task tends to answer "what would you like me
-# to work on?" rather than go and read it. Above the budget the middle is
-# elided and the head and tail are kept, so the original request and the latest
-# comments are both in front of the agent, with the complete copy in the task
-# file.
+# How much issue text is reproduced inside the user prompt itself. Delivery no
+# longer depends on this — the prompt is piped via stdin, not passed through
+# argv — but the agent's context window is not infinite, so very long threads
+# are still elided to the head (the original request) and the tail (the most
+# recent comments), with the complete copy in the task file.
 MAX_INLINE_ISSUE_TEXT_BYTES = 80 * 1024
 
 # When eliding, how much of the budget goes to the start of the thread. The
@@ -115,7 +132,7 @@ def build_task_document(payload: Dict[str, Any], task_id: int = 0) -> Dict[str, 
 
     This is the single source of truth for what was asked. It carries the whole
     thread however large it is, so nothing about the request depends on what
-    fits in the agent's argv. It deliberately carries no credentials: the repo
+    fits in the prompt. It deliberately carries no credentials: the repo
     token is container env, and the callback secret lives in the callback
     wrapper's own config.
     """
@@ -154,8 +171,8 @@ def _elide_middle(issue_text: str, max_bytes: int) -> str:
     return head + marker_template.format(omitted=omitted) + tail
 
 
-def _issue_section(issue_text: str, suggested_areas: str | None) -> str:
-    """The part of the prompt that carries the request.
+def _issue_section(issue_text: str) -> str:
+    """The part of the user prompt that carries the request.
 
     The request is always here, between the markers — never replaced by a
     pointer to a file. Handing a model a path instead of a task is what
@@ -190,14 +207,16 @@ work from what is below.
 
 
 def build_agent_instructions(payload: Dict[str, Any]) -> str:
-    """Build the instructions text handed to the coding agent.
+    """Build the user prompt handed to the coding agent: the task itself.
 
-    The instructions are agent-agnostic — they describe the contract without
-    assuming any particular CLI conventions.
+    Deliberately small. The standing contract — how to work, when to stop, how
+    to report — is built by :func:`build_system_prompt` and delivered
+    out-of-band, so the user prompt carries only what changes per run: the
+    request, verbatim, and pointers derived from it.
 
-    The contract is always complete. The request text is reproduced inline when
-    it fits in the agent's argv, and otherwise pointed at by path — the full
-    text always reaches the container as ``build_task_document``.
+    The request text is reproduced inline when it fits the context budget, and
+    otherwise elided to head + tail — the full text always reaches the
+    container as ``build_task_document``.
     """
     issue_text = _extract_issue_text(payload)
     if not issue_text.strip():
@@ -210,7 +229,46 @@ def build_agent_instructions(payload: Dict[str, Any]) -> str:
             "request: check that the ingestion payload carried a non-empty "
             "'issue.turns[].body' or 'issue.text'."
         )
+
     suggested_areas = _extract_suggested_areas(issue_text)
+    where_to_start_block = ""
+    if suggested_areas:
+        where_to_start_block = (
+            "\n## Where to Start\n\n"
+            'The request below includes a "Suggested codebase areas" section '
+            "identifying the paths most likely relevant to this task. Begin "
+            "your exploration there instead of scanning the entire repository "
+            "from scratch. Treat it as a starting point, not an exhaustive "
+            "boundary — follow the investigation beyond these paths if it "
+            "leads you elsewhere.\n"
+        )
+
+    issue_section = _issue_section(issue_text)
+
+    return f"""\
+# YOUR TASK — START WORKING ON THIS NOW
+
+You are a coding agent. The repository is already cloned at `{WORKSPACE}` and
+this is the request you must implement. Do not reply asking what to work on:
+the request is right here, and there is no one to answer you. Read it, then
+start.
+
+{issue_section}
+{where_to_start_block}
+Carry this out by following the standing procedure in `{SYSTEM_PROMPT_PATH}`,
+which is part of your instructions.
+"""
+
+
+def build_system_prompt(payload: Dict[str, Any]) -> str:
+    """Build the standing contract handed to the agent as its system prompt.
+
+    Agent-agnostic and issue-independent except for the callback endpoint
+    details, which are per-task by nature. Everything here is the same for
+    every run, so it is staged once as a file (``SYSTEM_PROMPT_PATH``) and
+    loaded by the agent through its ``instructions`` config rather than
+    riding in the user prompt or — worse — the agent's argv.
+    """
     provider = payload.get("repo", {}).get("provider_hint", "github")
     callback_url = payload.get("callback", {}).get("url", "")
     callback_secret = payload.get("callback", {}).get("secret", "")
@@ -238,35 +296,13 @@ def build_agent_instructions(payload: Dict[str, Any]) -> str:
     else:
         body_description = "the formatted text described above (UTF-8 encoded bytes)."
 
-    where_to_start_block = ""
-    if suggested_areas:
-        where_to_start_block = (
-            "\n## Where to Start\n\n"
-            'The issue text includes a "Suggested codebase areas" section '
-            "identifying the paths most likely relevant to this task:\n\n"
-            f"{suggested_areas}\n\n"
-            "Begin your exploration there instead of scanning the entire "
-            "repository from scratch. Treat it as a starting point, not an "
-            "exhaustive boundary — follow the investigation beyond these "
-            "paths if it leads you elsewhere.\n"
-        )
-
-    issue_section = _issue_section(issue_text, suggested_areas)
-
     return f"""\
-# YOUR TASK — START WORKING ON THIS NOW
-
-You are a coding agent. The repository is already cloned at `{WORKSPACE}` and
-this is the request you must implement. Do not reply asking what to work on:
-the request is right here, and there is no one to answer you. Read it, then
-start.
-
-{issue_section}
 # HOW TO CARRY IT OUT
 
-Everything below is the standing procedure for the request above. Implement
-exactly what the request asks for — do not summarize or pre-parse it, and do
-not stop to check anything with anyone.
+This is the standing procedure for every Jiffy task. It applies to the
+request you received as your task prompt — the request itself is not repeated
+here. Implement exactly what the request asks for — do not summarize or
+pre-parse it, and do not stop to check anything with anyone.
 
 Nobody is reading your chat output. Nothing you say in a reply reaches the
 person who asked: the only two things that leave this container are the file
@@ -296,13 +332,14 @@ container ran out of memory, not that your change was wrong.
 cap — do not unset or raise them. If an install or build is still OOM-killed,
 retry it with lower parallelism (e.g. `npm install --maxsockets=1`,
 `pnpm install --network-concurrency=1`) rather than raising the limits.
-{where_to_start_block}
+
 ## What You Must Do
 
 You own the entire rest of the workflow. Specifically:
 
-1. **Analyze** the repository and the issue text to understand what is being
-   requested and what languages, tools, and runtime versions are required.
+1. **Analyze** the repository and the request (your task prompt) to understand
+   what is being requested and what languages, tools, and runtime versions are
+   required.
 2. **Install** anything the generic sandbox image does not already provide.
    You have network access to PyPI, npm, Go module proxies, and common apt
    mirrors — use them freely.
@@ -310,11 +347,11 @@ You own the entire rest of the workflow. Specifically:
 4. **Verify** your work (run the project's existing tests, or write new ones if
    the project has none, or at minimum confirm the code runs without errors).
 5. **Commit and push** your changes to a new branch. Use the git credentials
-   available in your environment. If the issue text does not specify a branch
+   available in your environment. If the request does not specify a branch
    name, create one with the pattern `Jiffy/<short-description-of-change>`.
-6. **Open a Pull Request** via the provider's tooling *only if the issue text
+6. **Open a Pull Request** via the provider's tooling *only if the request
    explicitly asks you to open one*.
-7. **Code review mention** — *only if the issue text explicitly asks for a code
+7. **Code review mention** — *only if the request explicitly asks for a code
    review* — include a mention of the configured code-review bot handle in the
    PR description (if you opened a PR) or in your final result summary (if you
    did not).
@@ -351,8 +388,8 @@ When something is ambiguous, resolve it yourself:
   had to interpret.
 
 Never ask for the request to be re-sent, repeated, or completed, and never
-answer with "what would you like me to work on?" — the request is in this
-message, between the markers above. If you believe something is missing from
+answer with "what would you like me to work on?" — the request is in your task
+prompt, between the markers there. If you believe something is missing from
 it, you are wrong: proceed with what is there.
 
 The only acceptable outcome that is not finished work is an honest `"failed"`
@@ -619,7 +656,7 @@ def read_agent_result(container: Container) -> AgentResult:
                 error_message=(
                     result_data.get("error_message")
                     or "Agent result JSON is missing a valid 'status' field "
-                    f"(must be one of: {', '.join(sorted(VALID_AGENT_STATUSES))})."
+                    f"(must be one of: {', '.join(VALID_AGENT_STATUSES)})."
                 ),
                 question=question,
                 model=result_data.get("model"),

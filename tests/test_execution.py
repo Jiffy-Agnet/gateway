@@ -11,6 +11,7 @@ from django.test import TestCase, override_settings
 from apps.ingestion.callback import QUESTION_TAG, format_callback_body
 from jobs.execution.agent import (
     build_task_document,
+    build_system_prompt,
     ISSUE_BEGIN_MARKER,
     ISSUE_END_MARKER,
     AgentResult,
@@ -40,6 +41,7 @@ from jobs.execution.container import (
 )
 from jobs.execution.exceptions import AgentError, ContainerError
 from jobs.models import Task
+from tests.support import sandbox_container_mock
 
 
 # ---------------------------------------------------------------------------
@@ -110,8 +112,70 @@ class FormatTurnsTest(TestCase):
         self.assertEqual(result, "")
 
 
+class BuildSystemPromptTest(TestCase):
+    """Unit tests for build_system_prompt — the standing contract."""
+
+    def _make_payload(self, issue_text="Fix the bug", extra=None):
+        payload = {
+            "issue": {"text": issue_text, "external_issue_id": "123"},
+            "repo": {"url": "https://github.com/user/repo", "token": "tok"},
+            "callback": {"url": "https://example.com/cb", "secret": "s"},
+        }
+        if extra:
+            payload.update(extra)
+        return payload
+
+    def _system_prompt(self):
+        return build_system_prompt(self._make_payload())
+
+    def test_includes_output_contract(self):
+        system_prompt = self._system_prompt()
+        self.assertIn(".jiffy_result.json", system_prompt)
+        self.assertIn("status", system_prompt)
+        self.assertIn("branch_name", system_prompt)
+        self.assertIn("summary", system_prompt)
+        self.assertIn("technical_report", system_prompt)
+
+    def test_mentions_branch_fallback(self):
+        self.assertIn("Jiffy/", self._system_prompt())
+
+    def test_mentions_pr_only_if_asked(self):
+        self.assertIn("only if the request", self._system_prompt().lower())
+
+    def test_mentions_code_review_only_if_asked(self):
+        self.assertIn("code review", self._system_prompt().lower())
+
+    def test_includes_callback_spec(self):
+        system_prompt = self._system_prompt()
+        self.assertIn("Callback Delivery", system_prompt)
+        self.assertIn("- **URL**:", system_prompt)
+        self.assertIn("attempted", system_prompt)
+        self.assertIn("succeeded", system_prompt)
+
+    def test_includes_callback_url(self):
+        self.assertIn("https://example.com/cb", self._system_prompt())
+
+    def test_never_carries_the_issue_text(self):
+        """The contract is issue-free: the request lives only in the user prompt."""
+        system_prompt = build_system_prompt(
+            self._make_payload(issue_text="THE VERY SECRET REQUEST BODY")
+        )
+        self.assertNotIn("THE VERY SECRET REQUEST BODY", system_prompt)
+
+    def test_includes_technical_report_in_output_contract(self):
+        self.assertIn("technical_report", self._system_prompt())
+
+    def test_mentions_technical_report_structure(self):
+        system_prompt = self._system_prompt()
+        self.assertIn("Technical Report", system_prompt)
+        self.assertIn("What was done", system_prompt)
+        self.assertIn("Technology / approach chosen", system_prompt)
+        self.assertIn("Reasoning", system_prompt)
+        self.assertIn("Known limitations / follow-ups", system_prompt)
+
+
 class BuildAgentInstructionsTest(TestCase):
-    """Unit tests for build_agent_instructions."""
+    """Unit tests for build_agent_instructions — the per-task user prompt."""
 
     def _make_payload(self, issue_text="Fix the bug", extra=None):
         payload = {
@@ -138,60 +202,15 @@ class BuildAgentInstructionsTest(TestCase):
         instructions = build_agent_instructions(self._make_payload())
         self.assertIn("/workspace", instructions)
 
-    def test_includes_output_contract(self):
+    def test_points_at_the_standing_procedure(self):
         instructions = build_agent_instructions(self._make_payload())
-        self.assertIn(".jiffy_result.json", instructions)
-        self.assertIn("status", instructions)
-        self.assertIn("branch_name", instructions)
-        self.assertIn("summary", instructions)
-        self.assertIn("technical_report", instructions)
-
-    def test_mentions_branch_fallback(self):
-        instructions = build_agent_instructions(self._make_payload())
-        self.assertIn("Jiffy/", instructions)
-
-    def test_mentions_pr_only_if_asked(self):
-        instructions = build_agent_instructions(self._make_payload())
-        self.assertIn("only if the issue text", instructions.lower())
-
-    def test_mentions_code_review_only_if_asked(self):
-        instructions = build_agent_instructions(self._make_payload())
-        self.assertIn("code review", instructions.lower())
+        self.assertIn("standing procedure", instructions)
 
     def test_empty_issue_text_fails_instead_of_running_the_agent(self):
         """An empty request produces a clear failure, not a puzzled agent."""
         with self.assertRaises(AgentError) as ctx:
             build_agent_instructions(self._make_payload(issue_text=""))
         self.assertIn("issue text arrived empty", str(ctx.exception))
-
-    def test_includes_callback_spec(self):
-        instructions = build_agent_instructions(self._make_payload())
-        self.assertIn("Callback Delivery", instructions)
-        self.assertIn("- **URL**:", instructions)
-        self.assertIn("attempted", instructions)
-        self.assertIn("succeeded", instructions)
-
-    def test_includes_callback_url_and_secret(self):
-        instructions = build_agent_instructions(self._make_payload())
-        self.assertIn("https://example.com/cb", instructions)
-
-    def test_callback_field_in_output_contract(self):
-        instructions = build_agent_instructions(self._make_payload())
-        self.assertIn("callback", instructions)
-        self.assertIn("attempted", instructions)
-        self.assertIn("succeeded", instructions)
-
-    def test_includes_technical_report_in_output_contract(self):
-        instructions = build_agent_instructions(self._make_payload())
-        self.assertIn("technical_report", instructions)
-
-    def test_mentions_technical_report_structure(self):
-        instructions = build_agent_instructions(self._make_payload())
-        self.assertIn("Technical Report", instructions)
-        self.assertIn("What was done", instructions)
-        self.assertIn("Technology / approach chosen", instructions)
-        self.assertIn("Reasoning", instructions)
-        self.assertIn("Known limitations / follow-ups", instructions)
 
     def test_turns_preferred_over_text(self):
         payload = {
@@ -1259,10 +1278,10 @@ class NetworkRestrictionTest(TestCase):
     def _mock_container_start(self, docker_client):
         client = MagicMock()
         docker_client.return_value = client
-        container = MagicMock()
-        container.short_id = "abc123"
+        # The lifecycle stages files (config, prompts) and verifies their size,
+        # so the container double must answer `stat` like the real one.
+        container = sandbox_container_mock()
         container.id = "a" * 64
-        container.exec_run.return_value = (0, (b"ok", b""))
         client.containers.run.return_value = container
         return client, container
 
@@ -1326,10 +1345,16 @@ class NetworkRestrictionTest(TestCase):
     def test_start_container_restriction_failure_fails_closed(self, mock_client):
         client = MagicMock()
         mock_client.return_value = client
-        container = MagicMock()
-        container.short_id = "abc123"
+        container = sandbox_container_mock()
         container.id = "a" * 64
-        container.exec_run.return_value = (1, (b"", b"iptables: Permission denied"))
+        inner = container.exec_run.side_effect
+
+        def _deny_root(cmd=None, **kwargs):
+            if kwargs.get("user") == "root":
+                return 1, (b"", b"iptables: Permission denied")
+            return inner(cmd=cmd, **kwargs)
+
+        container.exec_run.side_effect = _deny_root
         client.containers.run.return_value = container
 
         with override_settings(SANDBOX_CLEANUP=False):
@@ -1342,10 +1367,8 @@ class NetworkRestrictionTest(TestCase):
     @patch("jobs.execution.container.get_docker_client")
     def test_start_container_logs_restriction_state(self, mock_client):
         mock_client.return_value = MagicMock()
-        container = MagicMock()
-        container.short_id = "abc123"
+        container = sandbox_container_mock()
         container.id = "a" * 64
-        container.exec_run.return_value = (0, (b"ok", b""))
         mock_client.return_value.containers.run.return_value = container
 
         with override_settings(SANDBOX_CLEANUP=False):
@@ -1376,6 +1399,13 @@ class AgentQuestionTest(TestCase):
     ``needs_input`` and relays the text as a reply — the answer arrives later
     as a brand-new task.
     """
+
+    def _payload(self):
+        return {
+            "repo": {"url": "https://github.com/user/repo"},
+            "issue": {"text": "Do the thing", "external_issue_id": "1"},
+            "callback": {"url": "https://example.com/cb", "secret": "sec"},
+        }
 
     def _create_task(self, **kwargs):
         defaults = {
@@ -1431,14 +1461,14 @@ class AgentQuestionTest(TestCase):
 
     def test_instructions_forbid_asking_entirely(self):
         """No human is watching a run, so a question is a run that did nothing."""
-        instructions = self._instructions()
-        collapsed = " ".join(instructions.split())
-        self.assertIn("## When Something Is Unclear", instructions)
+        system_prompt = build_system_prompt(self._payload())
+        collapsed = " ".join(system_prompt.split())
+        self.assertIn("## When Something Is Unclear", system_prompt)
         self.assertIn("Never ask a question. There is nobody to answer it.", collapsed)
-        self.assertNotIn("Asking a Question", instructions)
+        self.assertNotIn("Asking a Question", system_prompt)
 
     def test_instructions_tell_the_agent_to_deliver_what_it_understood(self):
-        collapsed = " ".join(self._instructions().split())
+        collapsed = " ".join(build_system_prompt(self._payload()).split())
         self.assertIn(
             "Whatever you understood of the request, implement it — completely.",
             collapsed,
@@ -1448,12 +1478,12 @@ class AgentQuestionTest(TestCase):
 
     def test_instructions_never_offer_a_question_status(self):
         """The prompt must not advertise a way out that stalls the task."""
-        instructions = self._instructions()
-        self.assertNotIn('`"question"`', instructions)
-        self.assertNotIn(QUESTION_TAG, instructions)
+        system_prompt = build_system_prompt(self._payload())
+        self.assertNotIn('`"question"`', system_prompt)
+        self.assertNotIn(QUESTION_TAG, system_prompt)
 
     def test_instructions_forbid_asking_for_the_request_back(self):
-        collapsed = " ".join(self._instructions().split())
+        collapsed = " ".join(build_system_prompt(self._payload()).split())
         self.assertIn("Never ask for the request to be re-sent", collapsed)
         self.assertIn('what would you like me to work on?', collapsed)
 

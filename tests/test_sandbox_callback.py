@@ -361,12 +361,12 @@ class StagingTest(TestCase):
 
 
 class InstructionsTest(TestCase):
-    """The prompt must hand delivery to the wrapper, not describe a retry policy."""
+    """The system prompt must hand delivery to the wrapper, not a retry policy."""
 
-    def _instructions(self):
-        from jobs.execution.agent import build_agent_instructions
+    def _system_prompt(self):
+        from jobs.execution.agent import build_system_prompt
 
-        return build_agent_instructions({
+        return build_system_prompt({
             "repo": {"url": "https://github.com/user/repo"},
             "issue": {"text": "Do the thing", "external_issue_id": "1"},
             "callback": {
@@ -376,13 +376,13 @@ class InstructionsTest(TestCase):
         })
 
     def test_agent_is_told_to_run_the_wrapper(self):
-        instructions = self._instructions()
-        self.assertIn(f"python3 {CALLBACK_SCRIPT_PATH} --body-file", instructions)
-        self.assertIn("Run the wrapper **exactly once**", instructions)
+        system_prompt = self._system_prompt()
+        self.assertIn(f"python3 {CALLBACK_SCRIPT_PATH} --body-file", system_prompt)
+        self.assertIn("Run the wrapper **exactly once**", system_prompt)
 
     def test_agent_is_forbidden_from_rolling_its_own_delivery(self):
-        instructions = self._instructions()
-        collapsed = " ".join(instructions.split())
+        system_prompt = self._system_prompt()
+        collapsed = " ".join(system_prompt.split())
         self.assertIn(
             "Do **not** write your own HTTP request, curl command, or retry loop",
             collapsed,
@@ -391,14 +391,14 @@ class InstructionsTest(TestCase):
 
     def test_prompt_carries_no_retry_decision_logic(self):
         """Retry is deterministic code; the prompt must not restate a policy."""
-        instructions = self._instructions()
-        for leaked in ("exponential", "backoff", "attempts", "5xx", "4xx"):
-            self.assertNotIn(leaked, instructions.lower())
+        system_prompt = self._system_prompt()
+        for leaked in ("exponential", "backoff", "5xx", "4xx"):
+            self.assertNotIn(leaked, system_prompt.lower())
 
     def test_agent_copies_the_wrappers_verdict_verbatim(self):
-        instructions = self._instructions()
-        self.assertIn("Do **not** invent the `callback` object", instructions)
-        self.assertIn("Use exactly what the wrapper", instructions)
+        system_prompt = self._system_prompt()
+        self.assertIn("Do **not** invent the `callback` object", system_prompt)
+        self.assertIn("Use exactly what the wrapper", system_prompt)
 
 
 class MissingWrapperSourceTest(TestCase):

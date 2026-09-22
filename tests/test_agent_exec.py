@@ -1,6 +1,9 @@
 """Tests for how the agent process is executed inside the sandbox container."""
 
 import json
+import os
+import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from django.test import TestCase, override_settings
@@ -10,10 +13,12 @@ from jobs.execution.agent import (
     ISSUE_END_MARKER,
     MAX_INLINE_ISSUE_TEXT_BYTES,
     build_agent_instructions,
+    build_system_prompt,
     build_task_document,
 )
 from jobs.execution.container import (
     PROMPT_PATH,
+    SYSTEM_PROMPT_PATH,
     TASK_JSON_PATH,
     build_agent_command,
     run_agent_in_container,
@@ -145,8 +150,169 @@ class TaskStagingTest(TestCase):
 
     def test_the_command_stays_tiny_whatever_the_thread(self):
         cmd = build_agent_command()
-        self.assertIn(f'"$(cat {PROMPT_PATH})"', cmd)
+        self.assertIn(f"< {PROMPT_PATH}", cmd)
         self.assertLess(len(cmd.encode("utf-8")), 4096)
+
+
+class StdinDeliveryTest(TestCase):
+    """The user prompt is delivered via stdin, never through argv.
+
+    ``opencode run`` merges piped stdin into its message (resolveRunInput in
+    the CLI source), so a stdin redirect sidesteps the kernel's 128 KiB
+    MAX_ARG_STRLEN cap on a single argv entry — the limit that used to make
+    every large thread fail with exit 126 "Argument list too long".
+    """
+
+    def test_the_command_never_expands_the_prompt_into_argv(self):
+        cmd = build_agent_command()
+        self.assertIn('opencode run --auto < ', cmd)
+        self.assertNotIn('$(cat', cmd)
+        self.assertNotIn('JIFFY_PROMPT', cmd)
+
+    def test_the_command_logs_the_byte_count_before_the_agent_starts(self):
+        cmd = build_agent_command()
+        self.assertIn('bytes of prompt to opencode', cmd)
+        self.assertIn('wc -c', cmd)
+
+    def test_a_huge_prompt_is_delivered_verbatim_whatever_its_size(self):
+        """The 80 KiB inline cap is a context budget, not a delivery limit.
+
+        A prompt past the old 128 KiB argv cap — which used to die with exit
+        126 "Argument list too long" — must stage whole and pass the
+        byte-exact delivery check: stdin has no MAX_ARG_STRLEN.
+        """
+        instructions = "Fix it. " * 30_000  # ~240 KiB
+        self.assertGreater(len(instructions.encode("utf-8")), 128 * 1024)
+
+        container = sandbox_container_mock([{"Running": False, "ExitCode": 0}])
+        run_agent_in_container(container, instructions, task_id=1)
+        staged = staged_files(container)
+        self.assertEqual(staged[PROMPT_PATH], instructions)
+
+
+class SystemPromptStagingTest(TestCase):
+    """The standing contract travels as a file and is loaded via the config."""
+
+    def test_system_prompt_is_staged_when_provided(self):
+        container = sandbox_container_mock([{"Running": False, "ExitCode": 0}])
+        run_agent_in_container(
+            container,
+            "the task",
+            task_id=1,
+            system_prompt="the standing contract",
+        )
+        staged = staged_files(container)
+        self.assertIn(SYSTEM_PROMPT_PATH, staged)
+        self.assertEqual(staged[SYSTEM_PROMPT_PATH], "the standing contract")
+        self.assertIn(PROMPT_PATH, staged)
+
+    def test_system_prompt_is_optional(self):
+        """Runs without one still work (the contract is additive, not required)."""
+        container = sandbox_container_mock([{"Running": False, "ExitCode": 0}])
+        run_agent_in_container(container, "the task", task_id=1)
+        self.assertNotIn(SYSTEM_PROMPT_PATH, staged_files(container))
+
+    def test_system_prompt_is_agent_agnostic_and_issue_free(self):
+        """The contract must not restate the request or embed per-issue content."""
+        system_prompt = build_system_prompt({
+            "repo": {"url": "https://github.com/user/repo"},
+            "issue": {"text": "Do the thing", "external_issue_id": "1"},
+            "callback": {"url": "https://example.com/cb", "secret": "sec"},
+        })
+        self.assertNotIn("Do the thing", system_prompt)
+        self.assertNotIn(ISSUE_BEGIN_MARKER, system_prompt)
+        for section in (
+            "## Working Directory",
+            "## When Something Is Unclear",
+            "## Callback Delivery",
+            "## Required Final Output",
+            ".jiffy_result.json",
+        ):
+            self.assertIn(section, system_prompt)
+
+
+class OpencodeConfigInjectionTest(TestCase):
+    """The injected config must register the staged system prompt."""
+
+    def _inject_with_root_config(self, root_config_text, container=None):
+        """Inject with a controlled project-root opencode.json; return the staged file."""
+        container = container or sandbox_container_mock()
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            fh.write(root_config_text)
+            tmp = fh.name
+        self.addCleanup(os.unlink, tmp)
+        with patch("jobs.execution.container._project_opencode_json_path") as fake_path:
+            fake_path.return_value = Path(tmp)
+            from jobs.execution.container import _inject_opencode_config
+
+            _inject_opencode_config(container, task_id=1)
+        staged = staged_files(container)
+        return staged.get("/home/jiffy/.config/opencode/opencode.json")
+
+    def test_config_registers_the_staged_system_prompt(self):
+        staged = self._inject_with_root_config('{"model": "opencode/m"}')
+        config = json.loads(staged)
+        self.assertEqual(config["instructions"][0], SYSTEM_PROMPT_PATH)
+        self.assertEqual(config["model"], "opencode/m")
+
+    def test_existing_instructions_are_kept_after_ours(self):
+        root = json.dumps({"instructions": ["CONTRIBUTING.md"]})
+        config = json.loads(self._inject_with_root_config(root))
+        self.assertEqual(
+            config["instructions"],
+            [SYSTEM_PROMPT_PATH, "CONTRIBUTING.md"],
+        )
+
+    def test_a_duplicate_registration_is_not_added_twice(self):
+        root = json.dumps({"instructions": [SYSTEM_PROMPT_PATH]})
+        config = json.loads(self._inject_with_root_config(root))
+        self.assertEqual(config["instructions"], [SYSTEM_PROMPT_PATH])
+
+    def test_an_unparseable_root_config_still_registers_the_contract(self):
+        staged = self._inject_with_root_config("{not json")
+        config = json.loads(staged)
+        self.assertEqual(config["instructions"], [SYSTEM_PROMPT_PATH])
+
+    def test_injection_failure_fails_closed_when_restricted(self):
+        container = sandbox_container_mock()
+        container.put_archive.side_effect = None
+        container.put_archive.return_value = False
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            fh.write("{}")
+            tmp = fh.name
+        self.addCleanup(os.unlink, tmp)
+        with patch("jobs.execution.container._project_opencode_json_path") as fake_path:
+            fake_path.return_value = Path(tmp)
+            from jobs.execution.container import _inject_opencode_config
+
+            with self.assertRaises(ContainerError) as ctx:
+                _inject_opencode_config(container, task_id=1)
+        self.assertIn("Failed to inject OpenCode config", str(ctx.exception))
+
+    def test_a_missing_root_config_fails_closed_when_restricted(self):
+        from jobs.execution.container import _inject_opencode_config
+
+        container = sandbox_container_mock()
+        with patch("jobs.execution.container._project_opencode_json_path") as fake_path:
+            fake_path.return_value = Path("/nonexistent/opencode.json")
+            with self.assertRaises(ContainerError) as ctx:
+                _inject_opencode_config(container, task_id=1)
+        self.assertIn("opencode.json not found", str(ctx.exception))
+
+    def test_a_missing_root_config_warns_when_unrestricted(self):
+        from jobs.execution.container import _inject_opencode_config
+
+        container = sandbox_container_mock()
+        with override_settings(SANDBOX_NETWORK_RESTRICTED=False):
+            with patch("jobs.execution.container._project_opencode_json_path") as fake_path:
+                fake_path.return_value = Path("/nonexistent/opencode.json")
+                with self.assertLogs("jobs.execution.container", level="WARNING"):
+                    _inject_opencode_config(container, task_id=1)
+        # Nothing staged, but the run is not failed: debugging mode.
+        self.assertEqual(
+            staged_files(container).get("/home/jiffy/.config/opencode/opencode.json"),
+            None,
+        )
 
 
 class IssueSectionTest(TestCase):
@@ -212,15 +378,22 @@ class IssueSectionTest(TestCase):
         self.assertLess(len(instructions.encode("utf-8")), 110 * 1024)
 
     def test_the_contract_survives_at_every_size(self):
+        """The request may be elided; the contract never is — it is a separate file."""
+        system_prompt = build_system_prompt({
+            "repo": {"url": "https://github.com/user/repo"},
+            "issue": {"text": "Do the thing", "external_issue_id": "1"},
+            "callback": {"url": "https://example.com/cb", "secret": "sec"},
+        })
+        for section in (
+            "## Callback Delivery",
+            "## Required Final Output",
+            ".jiffy_result.json",
+            "## When Something Is Unclear",
+        ):
+            self.assertIn(section, system_prompt)
         for body in ("tiny", "Fix it.\n" + ("history line\n" * 40000)):
             instructions = self._instructions(body)
-            for section in (
-                "## Callback Delivery",
-                "## Required Final Output",
-                ".jiffy_result.json",
-                "## When Something Is Unclear",
-            ):
-                self.assertIn(section, instructions)
+            self.assertIn("standing procedure", instructions)
 
 
 class StagedFileVerificationTest(TestCase):
@@ -261,12 +434,12 @@ class StagedFileVerificationTest(TestCase):
                 container,
                 "the prompt",
                 task_id=3,
-                task_document={"issue_text": "the request", "issue_text_inlined": True},
+                task_document={"issue_text": "the request", "issue_text_elided_in_prompt": False},
             )
         message = "\n".join(cm.output)
         self.assertIn("Task handed off", message)
         self.assertIn("sha256:", message)
-        self.assertIn("inlined", message)
+        self.assertIn("via stdin", message)
 
     def test_a_by_reference_handoff_is_logged_as_such(self):
         container = sandbox_container_mock([{"Running": False, "ExitCode": 0}])
@@ -275,9 +448,9 @@ class StagedFileVerificationTest(TestCase):
                 container,
                 "the prompt",
                 task_id=3,
-                task_document={"issue_text": "x" * 100, "issue_text_inlined": False},
+                task_document={"issue_text": "x" * 100, "issue_text_elided_in_prompt": True},
             )
-        self.assertIn("by reference", "\n".join(cm.output))
+        self.assertIn("elided", "\n".join(cm.output))
 
 
 class MissingResultDiagnosticsTest(TestCase):
@@ -323,19 +496,19 @@ class MissingResultDiagnosticsTest(TestCase):
 class ResultContractProminenceTest(TestCase):
     """The result file must be impossible to miss, not a footnote."""
 
-    def _instructions(self):
-        return build_agent_instructions({
+    def _payload(self):
+        return {
             "repo": {"url": "https://github.com/user/repo"},
             "issue": {"text": "Do the thing", "external_issue_id": "1"},
             "callback": {"url": "https://example.com/cb", "secret": "sec"},
-        })
+        }
 
     def test_the_result_file_is_a_numbered_step(self):
-        instructions = self._instructions()
-        self.assertIn("9. **Write the result file**", instructions)
+        system_prompt = build_system_prompt(self._payload())
+        self.assertIn("9. **Write the result file**", system_prompt)
 
     def test_the_agent_is_told_chat_output_reaches_nobody(self):
-        collapsed = " ".join(self._instructions().split())
+        collapsed = " ".join(build_system_prompt(self._payload()).split())
         self.assertIn("Nobody is reading your chat output", collapsed)
         self.assertIn("Answering in chat instead of doing those is the same as doing nothing", collapsed)
 
@@ -343,10 +516,10 @@ class ResultContractProminenceTest(TestCase):
 class PromptDeliveryVerificationTest(TestCase):
     """Staging proves the file landed; this proves the agent gets it.
 
-    What reaches `opencode` is a command substitution in a login shell, not the
-    file. Nothing used to confirm that step, so an empty prompt surfaced only
-    as the agent answering "what would you like me to work on?" — the same
-    symptom as a dozen unrelated faults.
+    What the agent consumes is a stdin redirect inside a login shell. The
+    byte-exact read-back catches a truncated or missing file before the agent
+    starts — an empty prompt surfaces only as the agent answering "what would
+    you like me to work on?", the same symptom as a dozen unrelated faults.
     """
 
     def _container(self, delivered_bytes=None):
@@ -388,15 +561,15 @@ class PromptDeliveryVerificationTest(TestCase):
         container.client.api.exec_create.assert_not_called()
 
     def test_trailing_newlines_are_not_counted_as_loss(self):
-        """Command substitution strips them, so the check must expect that."""
+        """Delivery is verbatim stdin, so newlines are not stripped anywhere."""
         container = sandbox_container_mock([{"Running": False, "ExitCode": 0}])
         run_agent_in_container(container, "prompt text\n\n\n", task_id=1)
         container.client.api.exec_create.assert_called_once()
 
     def test_the_command_logs_what_it_hands_over(self):
         cmd = build_agent_command()
-        self.assertIn("chars of prompt to opencode", cmd)
-        self.assertIn('opencode run --auto "$JIFFY_PROMPT"', cmd)
+        self.assertIn("bytes of prompt to opencode", cmd)
+        self.assertIn('opencode run --auto <', cmd)
 
 
 class PromptShapeTest(TestCase):
@@ -414,10 +587,15 @@ class PromptShapeTest(TestCase):
         self.assertTrue(instructions.startswith("# YOUR TASK"))
 
     def test_the_request_comes_before_the_procedure(self):
+        """The request is read first; the procedure is pointed at, after it."""
         instructions = self._instructions()
         self.assertLess(
             instructions.index(ISSUE_END_MARKER),
-            instructions.index("# HOW TO CARRY IT OUT"),
+            instructions.index("standing procedure"),
+        )
+        self.assertLess(
+            instructions.index(ISSUE_END_MARKER),
+            instructions.index(SYSTEM_PROMPT_PATH),
         )
 
     def test_the_request_appears_within_the_first_lines(self):

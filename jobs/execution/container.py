@@ -492,42 +492,93 @@ def _apply_pnpm_limits(container: Container, task_id: int = 0) -> None:
 SANDBOX_OPENCODE_CONFIG_PATH_IN_CONTAINER = "/home/jiffy/.config/opencode/opencode.json"
 
 
+def _project_opencode_json_path() -> Path:
+    """Location of the Gateway's own OpenCode config (the project root)."""
+    return Path(__file__).resolve().parent.parent.parent / "opencode.json"
+
+
+def _opencode_config_with_instructions(config_text: str) -> str:
+    """Merge the staged system prompt into an OpenCode config's ``instructions``.
+
+    The ``instructions`` list is how ``opencode`` loads standing rules from
+    files — exactly what the system prompt is. Existing entries (project
+    defaults) are kept; ours is added first so the contract is read before
+    anything else. A config that is not valid JSON is replaced with a minimal
+    one that still registers the system prompt: running without the contract
+    is worse than running without an unparseable project default.
+    """
+    try:
+        config = json.loads(config_text)
+    except (json.JSONDecodeError, TypeError):
+        logger.warning(
+            "opencode.json is not valid JSON — replacing it with a minimal "
+            "config that registers the staged system prompt"
+        )
+        config = {}
+    if not isinstance(config, dict):
+        config = {}
+    instructions = config.get("instructions")
+    if not isinstance(instructions, list):
+        instructions = []
+    instructions = [i for i in instructions if i != SYSTEM_PROMPT_PATH]
+    config["instructions"] = [SYSTEM_PROMPT_PATH] + instructions
+    return json.dumps(config, ensure_ascii=False, indent=2)
+
+
 def _inject_opencode_config(container: Container, task_id: int) -> None:
-    """Read the OpenCode config file and write it into the sandbox container.
+    """Write the OpenCode config into the sandbox, with the system prompt registered.
 
     This avoids volume-mount path issues when the Celery worker runs inside
     Docker (the Docker daemon needs host-accessible paths, but the config
-    file is only accessible inside the Celery container).
+    file is only accessible inside the Celery container). The merged config is
+    uploaded as a tar archive like every other staged file — no shell command
+    carries it, so nothing about its content can break the write.
+
+    The staged system prompt is registered under ``instructions``, so the
+    standing contract is loaded by the agent itself from
+    ``SYSTEM_PROMPT_PATH``. Because that contract is load-bearing (it is where
+    the result file and callback rules live), a failed injection fails the
+    task when network restriction is on — the same fail-closed rule the
+    sandbox applies to egress. With restriction off, injection stays
+    best-effort: the agent runs with the image's placeholder config and no
+    contract, which is a degraded but survivable state for debugging.
     """
-    # Read opencode.json from the project root
-    config_path = Path(__file__).resolve().parent.parent.parent / "opencode.json"
+    strict = settings.SANDBOX_NETWORK_RESTRICTED
+    config_path = _project_opencode_json_path()
+
+    def _fail_or_warn(message: str) -> None:
+        if strict:
+            raise ContainerError(message)
+        logger.warning("[%d] %s", task_id, message)
+
     if not config_path.is_file():
-        logger.warning(
-            "[%d] opencode.json not found in project root: %s",
-            task_id,
-            config_path,
+        _fail_or_warn(
+            f"opencode.json not found in project root ({config_path}) — the "
+            f"staged system prompt at {SYSTEM_PROMPT_PATH} would never be "
+            "loaded by the agent"
         )
         return
 
     try:
-        config_content = config_path.read_text(encoding="utf-8")
-        # Write config into the container using printf + heredoc to avoid escaping issues
-        escaped = config_content.replace("\\", "\\\\").replace("'", "'\\''")
-        write_cmd = f"printf '%s' '{escaped}' > {SANDBOX_OPENCODE_CONFIG_PATH_IN_CONTAINER}"
-        exit_code, (_, err) = container.exec_run(
-            cmd=["bash", "-c", write_cmd],
-            demux=True,
+        merged = _opencode_config_with_instructions(
+            config_path.read_text(encoding="utf-8")
         )
-        if exit_code != 0:
-            logger.warning(
-                "[%d] Failed to inject OpenCode config: %s",
-                task_id,
-                (err or b"").decode(errors="replace"),
-            )
-        else:
-            logger.info("[%d] Injected OpenCode config into sandbox container", task_id)
-    except Exception as e:
-        logger.warning("[%d] Failed to inject OpenCode config: %s", task_id, e)
+    except OSError as exc:
+        _fail_or_warn(f"Could not read opencode.json: {exc}")
+        return
+
+    try:
+        stage_file_in_container(
+            container, SANDBOX_OPENCODE_CONFIG_PATH_IN_CONTAINER, merged
+        )
+    except ContainerError as exc:
+        _fail_or_warn(f"Failed to inject OpenCode config: {exc}")
+        return
+    logger.info(
+        "[%d] Injected OpenCode config (instructions: %s) into sandbox container",
+        task_id,
+        SYSTEM_PROMPT_PATH,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -840,6 +891,12 @@ def _wait_for_exec(
 # kernel caps at 128 KiB, so the task itself must travel by file.
 TASK_JSON_PATH = "/tmp/jiffy_task.json"
 
+# The standing contract (system prompt), staged alongside it. ``opencode``
+# loads it through the ``instructions`` list of its config, which is injected
+# with this path registered — so the contract is read from the filesystem
+# before the agent sees the request, and never travels through argv.
+SYSTEM_PROMPT_PATH = "/tmp/jiffy_system_prompt.txt"
+
 # The deterministic callback sender staged alongside it, and the config that
 # tells it where to post and how hard to retry.  The script is staged per run
 # rather than baked into the image so it stays in lockstep with the Gateway
@@ -961,48 +1018,51 @@ def stage_callback_wrapper(
     )
 
 
-# Where the prompt is staged. ``opencode run`` takes its prompt from argv only,
-# so the shell reads it back out of this file at exec time rather than the
-# Gateway embedding it in a command string (which would be an argv entry too).
+# Where the user prompt is staged. ``opencode run`` merges piped stdin into
+# its message, so the shell feeds this file to the agent's stdin instead of
+# expanding it into an argv entry: a single argv string is capped at 128 KiB
+# by the kernel (MAX_ARG_STRLEN), while stdin is bounded only by disk. The
+# standing contract is staged at SYSTEM_PROMPT_PATH above and loaded by the
+# agent through its config.
 PROMPT_PATH = "/tmp/jiffy_prompt.txt"
 
 
 def build_agent_command() -> str:
     """The shell command that runs the agent over the staged prompt.
 
-    The prompt is substituted from a file rather than embedded in this string:
-    the command itself is an argv entry too, so inlining the text here would
-    hit the same kernel limit twice over.
+    The prompt is fed to the agent's stdin rather than expanded into the
+    command: ``$(cat …)`` produces a single argv entry, which the kernel caps
+    at 128 KiB (MAX_ARG_STRLEN) — a guaranteed exit 126 "Argument list too
+    long" on a large thread. A stdin redirect has no such limit, and
+    ``opencode run`` folds piped input into the message it sends.
 
-    The size of what the shell actually resolved is echoed to the container log
-    first. That one line is the difference between knowing the agent was handed
-    the task and inferring it from whatever the agent then said.
+    The size of what is handed over is echoed to the container log first. That
+    one line is the difference between knowing the agent was handed the task
+    and inferring it from whatever the agent then said.
     """
     return (
         f"cd {WORKSPACE} && "
-        f'JIFFY_PROMPT="$(cat {PROMPT_PATH})" && '
-        'echo "[jiffy] handing ${#JIFFY_PROMPT} chars of prompt to opencode" '
+        f"PROMPT_BYTES=$(wc -c < {PROMPT_PATH} | tr -d ' ') && "
+        'echo "[jiffy] handing $PROMPT_BYTES bytes of prompt to opencode via stdin" '
         "> /proc/1/fd/1 && "
-        'opencode run --auto "$JIFFY_PROMPT" > /proc/1/fd/1 2>&1'
+        f"opencode run --auto < {PROMPT_PATH} > /proc/1/fd/1 2>&1"
     )
 
 
-def verify_prompt_reaches_argv(container: Container, prompt: str, task_id: int = 0) -> None:
-    """Check the prompt survives the exact path it takes to the agent.
+def verify_prompt_delivery(container: Container, prompt: str, task_id: int = 0) -> None:
+    """Check the staged prompt survives the exact path it takes to the agent.
 
     Staging is verified by size, but that only proves the file landed. What
-    actually reaches ``opencode`` is the result of a command substitution in a
-    login shell, and nothing so far has ever confirmed *that* carries the whole
-    prompt. Run it here, before the agent, and fail the task if it does not:
-    an agent handed an empty prompt answers "what would you like me to work
-    on?", which is indistinguishable from a dozen other faults after the fact.
+    the agent consumes is a redirect inside a login shell, so read the file
+    back through that same ``bash -l -c`` path and fail the task if it does
+    not match: an agent handed an empty prompt answers "what would you like
+    me to work on?", which is indistinguishable from a dozen other faults
+    after the fact.
     """
-    # Command substitution strips trailing newlines, so that is what the agent
-    # receives and what this compares against.
-    expected = len(prompt.rstrip("\n").encode("utf-8"))
+    expected = len(prompt.encode("utf-8"))
     try:
         exit_code, (out, err) = container.exec_run(
-            cmd=["bash", "-l", "-c", f'printf %s "$(cat {PROMPT_PATH})" | wc -c'],
+            cmd=["bash", "-l", "-c", f"wc -c < {PROMPT_PATH}"],
             demux=True,
         )
     except Exception as exc:
@@ -1018,11 +1078,11 @@ def verify_prompt_reaches_argv(container: Container, prompt: str, task_id: int =
     if delivered != str(expected):
         raise ContainerError(
             f"The prompt does not survive delivery to the agent: {expected} bytes "
-            f"staged at {PROMPT_PATH} but the shell resolves {delivered}. The "
+            f"staged at {PROMPT_PATH} but the shell reads {delivered}. The "
             "agent would have been handed an incomplete or empty task."
         )
     logger.info(
-        "[%d] Prompt delivery verified: %d bytes reach the agent's argv",
+        "[%d] Prompt delivery verified: %d bytes staged for stdin delivery",
         task_id,
         expected,
     )
@@ -1041,15 +1101,17 @@ def _log_prompt_delivery(
     issue_text = (task_document or {}).get("issue_text", "")
     issue_bytes = len(issue_text.encode("utf-8"))
     digest = hashlib.sha256(issue_text.encode("utf-8")).hexdigest()[:12]
+    elided = bool((task_document or {}).get("issue_text_elided_in_prompt"))
     logger.info(
         "[%d] Task handed off: issue_text=%d bytes (sha256:%s) staged at %s, "
-        "prompt=%d bytes, request text %s in the prompt",
+        "user prompt=%d bytes delivered via stdin from %s, request text %s",
         task_id,
         issue_bytes,
         digest,
         TASK_JSON_PATH,
         len(prompt.encode("utf-8")),
-        "inlined" if (task_document or {}).get("issue_text_inlined") else "by reference",
+        PROMPT_PATH,
+        "elided (head+tail; full text in the task file)" if elided else "inlined in full",
     )
 
 
@@ -1060,8 +1122,19 @@ def run_agent_in_container(
         timeout_seconds: int | None = None,
         callback_config: Dict[str, Any] | None = None,
         task_document: Dict[str, Any] | None = None,
+        system_prompt: str | None = None,
 ) -> None:
-    """Run the coding agent inside the container with the given instructions."""
+    """Run the coding agent inside the container with the given instructions.
+
+    Nothing reaches the agent through argv. The user prompt (*instructions*,
+    the request for this run) is staged at ``PROMPT_PATH`` and fed to the
+    agent's stdin; the standing contract (*system_prompt*) is staged at
+    ``SYSTEM_PROMPT_PATH``, which the injected OpenCode config registers under
+    ``instructions`` so the agent loads it from the filesystem. Both staged
+    files are verified after upload, so a truncated hand-off fails the task
+    here instead of surfacing later as the agent saying the message looks cut
+    off.
+    """
     effective_timeout = timeout_seconds or getattr(
         settings, "SANDBOX_AGENT_TIMEOUT_SECONDS", DEFAULT_AGENT_TIMEOUT_SECONDS
     )
@@ -1069,14 +1142,16 @@ def run_agent_in_container(
     logger.info("[%d] Running agent in container %s (timeout=%ds, model=%s)", task_id, container.short_id,
                 effective_timeout, model)
 
-    # The task JSON always carries the whole request; the prompt carries the
-    # contract and, when it fits, a copy of the request text. Both are verified
-    # after upload, so a truncated hand-off fails the task here instead of
-    # surfacing later as the agent saying the message looks cut off.
+    # The task JSON always carries the whole request; the user prompt carries
+    # the request text and the system prompt the standing contract. Both are
+    # verified after upload, so a truncated hand-off fails the task here
+    # instead of surfacing later as the agent saying the message looks cut off.
     if task_document is not None:
         write_task_document(container, task_document)
+    if system_prompt is not None:
+        stage_file_in_container(container, SYSTEM_PROMPT_PATH, system_prompt)
     stage_file_in_container(container, PROMPT_PATH, instructions)
-    verify_prompt_reaches_argv(container, instructions, task_id=task_id)
+    verify_prompt_delivery(container, instructions, task_id=task_id)
     _log_prompt_delivery(task_document, instructions, task_id)
 
     if callback_config:

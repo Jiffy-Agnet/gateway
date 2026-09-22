@@ -36,12 +36,12 @@ def sandbox_container_mock(exec_results=None, model="test/model"):
             return 0, (str(staged_sizes[path]).encode(), b"")
         script = cmd[-1] if cmd else ""
         if "wc -c" in script:
-            # The prompt-delivery check: a command substitution strips trailing
-            # newlines, so mirror that rather than reporting the file size.
+            # The prompt-delivery check: the agent consumes the file verbatim
+            # via stdin, so report the file's exact byte count.
             for path, content in staged_content.items():
                 if path in script:
                     return 0, (
-                        str(len(content.rstrip("\n").encode("utf-8"))).encode(),
+                        str(len(content.encode("utf-8"))).encode(),
                         b"",
                     )
             return 1, (b"", b"No such file or directory")
