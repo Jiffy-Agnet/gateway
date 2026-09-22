@@ -268,8 +268,19 @@ class OpencodeConfigInjectionTest(TestCase):
         config = json.loads(self._inject_with_root_config(root))
         self.assertEqual(config["instructions"], [SYSTEM_PROMPT_PATH])
 
+    def test_an_unparseable_root_config_fails_closed_when_restricted(self):
+        # An empty or corrupt config silently drops model and plugin, and the
+        # agent then runs against whatever default its credentials resolve to.
+        for text in ("", "{not json", "[]"):
+            with self.subTest(text=text):
+                with self.assertRaises(ContainerError) as ctx:
+                    self._inject_with_root_config(text)
+                self.assertIn("opencode.json", str(ctx.exception))
+
     def test_an_unparseable_root_config_still_registers_the_contract(self):
-        staged = self._inject_with_root_config("{not json")
+        with override_settings(SANDBOX_NETWORK_RESTRICTED=False):
+            with self.assertLogs("jobs.execution.container", level="WARNING"):
+                staged = self._inject_with_root_config("{not json")
         config = json.loads(staged)
         self.assertEqual(config["instructions"], [SYSTEM_PROMPT_PATH])
 

@@ -503,20 +503,23 @@ def _opencode_config_with_instructions(config_text: str) -> str:
     The ``instructions`` list is how ``opencode`` loads standing rules from
     files — exactly what the system prompt is. Existing entries (project
     defaults) are kept; ours is added first so the contract is read before
-    anything else. A config that is not valid JSON is replaced with a minimal
-    one that still registers the system prompt: running without the contract
-    is worse than running without an unparseable project default.
+    anything else.
+
+    Raises ``ValueError`` when the text is not a JSON object. Quietly falling
+    back to an empty config would also drop ``model`` and ``plugin``, and the
+    agent then runs against whatever default its credentials resolve to —
+    which surfaces as an opaque provider error with nothing pointing back at
+    the config. The caller decides whether that is fatal.
     """
     try:
         config = json.loads(config_text)
-    except (json.JSONDecodeError, TypeError):
-        logger.warning(
-            "opencode.json is not valid JSON — replacing it with a minimal "
-            "config that registers the staged system prompt"
-        )
-        config = {}
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError(f"opencode.json is not valid JSON: {exc}") from exc
     if not isinstance(config, dict):
-        config = {}
+        raise ValueError(
+            "opencode.json must hold a JSON object, got "
+            f"{type(config).__name__}"
+        )
     instructions = config.get("instructions")
     if not isinstance(instructions, list):
         instructions = []
@@ -560,12 +563,19 @@ def _inject_opencode_config(container: Container, task_id: int) -> None:
         return
 
     try:
-        merged = _opencode_config_with_instructions(
-            config_path.read_text(encoding="utf-8")
-        )
+        config_text = config_path.read_text(encoding="utf-8")
     except OSError as exc:
         _fail_or_warn(f"Could not read opencode.json: {exc}")
         return
+
+    try:
+        merged = _opencode_config_with_instructions(config_text)
+    except ValueError as exc:
+        # Treated exactly like a missing config: it is one, as far as the
+        # settings it carries are concerned. In debugging mode the run still
+        # gets a minimal config so the contract reaches the agent.
+        _fail_or_warn(f"{exc} ({config_path}) — model and plugin are dropped")
+        merged = _opencode_config_with_instructions("{}")
 
     try:
         stage_file_in_container(
